@@ -648,19 +648,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b947ae49db0d222b1dbc6b113ce7248a3fc3a6ca21b696717bfc000ba4484d8"
 
 [[package]]
-name = "mest-cli"
-version = "0.1.0"
-dependencies = [
- "ariadne",
- "bumpalo",
- "chumsky",
- "clap",
- "lasso",
- "logos",
- "mest-core",
-]
-
-[[package]]
 name = "mest-core"
 version = "0.1.0"
 dependencies = [
@@ -679,6 +666,19 @@ dependencies = [
  "mest-core",
  "tokio",
  "tower-lsp",
+]
+
+[[package]]
+name = "mestc"
+version = "0.1.0"
+dependencies = [
+ "ariadne",
+ "bumpalo",
+ "chumsky",
+ "clap",
+ "lasso",
+ "logos",
+ "mest-core",
 ]
 
 [[package]]

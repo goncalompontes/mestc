@@ -1,0 +1,25 @@
+[package]
+name = "mestc"
+version = "0.1.0"
+edition = "2024"
+description = "A simple functional programming language for learning purposes"
+license = "MIT"
+repository = "https://github.com/goncalompontes/mestc"
+readme = "../README.md"
+keywords = ["language", "functional", "programming-language"]
+categories = ["command-line-utilities", "development-tools"]
+rust-version = "1.85"
+
+[[bin]]
+name = "mest"
+path = "src/main.rs"
+
+[dependencies]
+ariadne = { workspace = true }
+bumpalo = { workspace = true }
+chumsky = { workspace = true }
+clap = { workspace = true }
+lasso = { workspace = true }
+logos = { workspace = true }
+mest-core = { path = "../mest-core", version = "0.1.0" }
+

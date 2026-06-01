@@ -2,6 +2,12 @@
 name = "mest-core"
 version = "0.1.0"
 edition = "2024"
+description = "Core language library for the Mest programming language"
+license = "MIT"
+repository = "https://github.com/goncalompontes/mestc"
+keywords = ["language", "functional", "programming-language"]
+categories = ["development-tools"]
+rust-version = "1.85"
 
 [dependencies]
 bumpalo = { workspace = true }

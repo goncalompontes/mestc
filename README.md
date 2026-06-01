@@ -1,34 +1,30 @@
-# mestc — Mest compiler
+# mest — Mest compiler
 
 A simple functional programming language for learning purposes, built with Rust.
 
-## Features
-
-- First-class functions, closures, currying
-- Lazy evaluation with memoized thunks
-- Pattern matching
-- Recursive bindings (`let rec`)
-- Lambda expressions (`|param| body`)
-- Standard arithmetic, comparison, and logical operators
-- Hindley-Milner type inference (in progress)
-
-## Building
+## Install
 
 ```sh
-cargo build --release
+cargo install mestc
 ```
 
 ## Usage
 
 ```sh
 # Evaluate an expression
-mestc eval "let add = |x| |y| x + y in add 3 4"
+mest eval "let add = |x| |y| x + y in add 3 4"
 
 # Run a .mest file
-mestc run program.mest
+mest run program.mest
 
 # Tokenize and print tokens
-mestc lex "let x = 42 in x"
+mest lex "let x = 42 in x"
+```
+
+## Build from source
+
+```sh
+cargo build --release
 ```
 
 ## Project structure
@@ -36,7 +32,7 @@ mestc lex "let x = 42 in x"
 | Crate | Description |
 |---|---|
 | `mest-core` | Core language: lexer, parser, AST, type inference, evaluator |
-| `mest-cli` | CLI binary (`mestc`) |
+| `mestc` | CLI binary (`mest`) |
 | `mest-lsp` | LSP server for editor integration |
 
 ## Language example

@@ -1,9 +1,10 @@
 [workspace]
 members = [
     "crates/mest-core",
-    "crates/mest-cli",
+    "crates/mestc",
     "crates/mest-lsp",
 ]
+default-members = ["crates/mestc"]
 resolver = "2"
 
 [workspace.dependencies]
