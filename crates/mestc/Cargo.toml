@@ -5,7 +5,6 @@ edition = "2024"
 description = "A simple functional programming language for learning purposes"
 license = "MIT"
 repository = "https://github.com/goncalompontes/mestc"
-readme = "../README.md"
 keywords = ["language", "functional", "programming-language"]
 categories = ["command-line-utilities", "development-tools"]
 rust-version = "1.85"
