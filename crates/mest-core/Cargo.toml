@@ -1,0 +1,13 @@
+[package]
+name = "mest-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bumpalo = { workspace = true }
+chumsky = { workspace = true }
+derive_more = { workspace = true }
+im = { workspace = true }
+lasso = { workspace = true }
+logos = { workspace = true }
+

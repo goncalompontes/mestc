@@ -1,0 +1,18 @@
+[package]
+name = "mest-cli"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "mestc"
+path = "src/main.rs"
+
+[dependencies]
+ariadne = { workspace = true }
+bumpalo = { workspace = true }
+chumsky = { workspace = true }
+clap = { workspace = true }
+lasso = { workspace = true }
+logos = { workspace = true }
+mest-core = { path = "../mest-core" }
+

@@ -1,0 +1,9 @@
+[package]
+name = "mest-lsp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+mest-core = { path = "../mest-core" }
+tower-lsp = "0.20.0"
+tokio.workspace = true
