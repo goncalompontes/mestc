@@ -1,6 +1,6 @@
 [package]
 name = "mestc"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
 description = "A simple functional programming language for learning purposes"
 license = "MIT"
@@ -20,5 +20,5 @@ chumsky = { workspace = true }
 clap = { workspace = true }
 lasso = { workspace = true }
 logos = { workspace = true }
-mest-core = { path = "../mest-core", version = "0.1.0" }
+mest-core = { path = "../mest-core", version = "0.3.0" }
 

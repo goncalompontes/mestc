@@ -4,7 +4,7 @@ let rec factorial n =
 	| n => n * factorial (n - 1)
 in
 
-let rec fib n =
+let rec fib = |n|
 	match n
 	| 0 => 0
 	| 1 => 1

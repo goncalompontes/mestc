@@ -5,3 +5,4 @@ pub mod parser;
 pub mod thunk;
 pub mod token;
 pub mod typecheck;
+pub mod visitor;

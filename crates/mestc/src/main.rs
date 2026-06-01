@@ -7,7 +7,12 @@ use chumsky::{
 use clap::{Parser as ClapParser, Subcommand};
 use lasso::Rodeo;
 use logos::Logos;
-use mest_core::{ast::Env, parser::parser, token::Token};
+use mest_core::{
+    ast::Env,
+    parser::parser,
+    token::Token,
+    visitor::{AstPrinter, PrintCtx},
+};
 
 #[derive(ClapParser)]
 #[command(name = "mylang", about = "A simple functional language")]
@@ -32,6 +37,11 @@ enum Command {
     Lex {
         /// The expression to lex
         expr: String,
+    },
+    /// Parse a file and print the AST
+    Parse {
+        /// Path to the source file
+        path: std::path::PathBuf,
     },
 }
 
@@ -90,6 +100,46 @@ fn lex(src: &str) {
     }
 }
 
+fn parse(src: &str) {
+    let token_iter = Token::lexer(src).spanned().map(|(tok, span)| match tok {
+        Ok(tok) => (tok, span.into()),
+        Err(()) => (Token::Error, span.into()),
+    });
+
+    let token_stream =
+        Stream::from_iter(token_iter).map((0..src.len()).into(), |(t, s): (_, _)| (t, s));
+
+    let bump = Bump::new();
+    let mut rodeo = chumsky::extra::SimpleState(Rodeo::new());
+
+    match parser(&bump)
+        .parse_with_state(token_stream, &mut rodeo)
+        .into_result()
+    {
+        Err(errs) => {
+            for err in errs {
+                Report::build(ariadne::ReportKind::Error, ((), err.span().into_range()))
+                    .with_config(
+                        ariadne::Config::new().with_index_type(ariadne::IndexType::Byte),
+                    )
+                    .with_code(3)
+                    .with_message(err.to_string())
+                    .with_label(
+                        Label::new(((), err.span().into_range()))
+                            .with_message(err.reason().to_string())
+                            .with_color(Color::Red),
+                    )
+                    .finish()
+                    .eprint(Source::from(src))
+                    .unwrap();
+            }
+        }
+        Ok(expr) => {
+            AstPrinter::print_expr(&expr, &mut PrintCtx::new(&rodeo));
+        }
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -104,5 +154,9 @@ fn main() {
         Command::Lex { expr } => {
             lex(&expr);
         }
+        Command::Parse { path } => match std::fs::read_to_string(&path) {
+            Ok(src) => parse(&src),
+            Err(err) => eprintln!("error reading {}: {}", path.display(), err),
+        },
     }
 }

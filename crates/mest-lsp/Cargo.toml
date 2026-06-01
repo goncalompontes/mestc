@@ -1,6 +1,6 @@
 [package]
 name = "mest-lsp"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
 description = "LSP server for the Mest programming language"
 license = "MIT"
@@ -8,6 +8,6 @@ repository = "https://github.com/goncalompontes/mestc"
 rust-version = "1.85"
 
 [dependencies]
-mest-core = { path = "../mest-core", version = "0.1.0" }
+mest-core = { path = "../mest-core", version = "0.3.0" }
 tower-lsp = "0.20.0"
 tokio.workspace = true
