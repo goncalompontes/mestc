@@ -185,7 +185,7 @@ fn check(src: &str) -> Result<(), ()> {
             let result = typecheck::typecheck(&expr, &mut rodeo);
             println!("{} : {}", AstPrinter::print_expr(&expr, &rodeo), result.ty);
             println!();
-            println!("{}", result.tree.display_tree());
+            println!("{}", result.tree.display_tree(&rodeo));
 
             if result.errors.is_empty() {
                 Ok(())

@@ -108,10 +108,155 @@ impl<'bump> Expr<'bump> {
     pub fn display<'a>(&'bump self, rodeo: &'a Rodeo) -> DisplayExpr<'a, 'bump> {
         DisplayExpr { expr: self, rodeo }
     }
+
+    pub fn display_inline<'a>(&'bump self, rodeo: &'a Rodeo) -> InlineDisplay<'a, 'bump> {
+        InlineDisplay { expr: self, rodeo }
+    }
 }
 
 fn indent(level: usize) -> String {
     "  ".repeat(level)
+}
+
+pub struct InlineDisplay<'a, 'bump> {
+    expr: &'bump Expr<'bump>,
+    rodeo: &'a Rodeo,
+}
+
+impl std::fmt::Display for InlineDisplay<'_, '_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write_inline(f, &**self.expr, self.rodeo)
+    }
+}
+
+fn write_inline(f: &mut std::fmt::Formatter, kind: &ExprKind, rodeo: &Rodeo) -> std::fmt::Result {
+    match kind {
+        ExprKind::Literal(lit) => match lit {
+            Literal::Int(n) => write!(f, "{n}"),
+            Literal::Float(v) => write!(f, "{v}"),
+            Literal::Bool(b) => f.write_str(if *b { "true" } else { "false" }),
+        },
+        ExprKind::Var(ident) => f.write_str(rodeo.resolve(&ident.0)),
+        ExprKind::If {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            write!(f, "if ")?;
+            write_inline(f, &**cond, rodeo)?;
+            write!(f, " then ")?;
+            write_inline(f, &**then_expr, rodeo)?;
+            write!(f, " else ")?;
+            write_inline(f, &**else_expr, rodeo)
+        }
+        ExprKind::BinOp { op, lhs, rhs } => {
+            let op_str = match op {
+                BinOp::Eq => " == ",
+                BinOp::NotEq => " != ",
+                BinOp::Lt => " < ",
+                BinOp::Gt => " > ",
+                BinOp::Le => " <= ",
+                BinOp::Ge => " >= ",
+                BinOp::And => " && ",
+                BinOp::Or => " || ",
+                BinOp::Add => " + ",
+                BinOp::Sub => " - ",
+                BinOp::Mul => " * ",
+                BinOp::Div => " / ",
+                BinOp::Pow => " ^ ",
+            };
+            parexpr_inline(lhs, op, rodeo, f)?;
+            f.write_str(op_str)?;
+            parexpr_inline(rhs, op, rodeo, f)
+        }
+        ExprKind::UnaryOp { op, rhs } => {
+            let op_str = match op {
+                UnaryOp::Neg => "-",
+                UnaryOp::Not => "!",
+            };
+            f.write_str(op_str)?;
+            write_inline(f, &**rhs, rodeo)
+        }
+        ExprKind::Let {
+            name,
+            value,
+            body,
+            rec,
+        } => {
+            if *rec {
+                write!(f, "let rec ")?;
+            } else {
+                write!(f, "let ")?;
+            }
+            write!(f, "{} = ", rodeo.resolve(&name.0))?;
+            write_inline(f, &**value, rodeo)?;
+            write!(f, " in ")?;
+            write_inline(f, &**body, rodeo)
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            write!(f, "match ")?;
+            write_inline(f, &**scrutinee, rodeo)?;
+            for (pat, body) in arms.iter() {
+                write!(f, " | ")?;
+                pat_write_inline(pat, rodeo, f)?;
+                write!(f, " => ")?;
+                write_inline(f, &**body, rodeo)?;
+            }
+            Ok(())
+        }
+        ExprKind::Abs { param, body } => {
+            write!(f, "|{}| ", rodeo.resolve(&param.0))?;
+            write_inline(f, &**body, rodeo)
+        }
+        ExprKind::App { func, arg } => {
+            let func_need_paren = matches!(&**func, ExprKind::Abs { .. } | ExprKind::If { .. } | ExprKind::Let { .. } | ExprKind::Match { .. });
+            if func_need_paren {
+                write!(f, "(")?;
+                write_inline(f, &**func, rodeo)?;
+                write!(f, ")")?;
+            } else {
+                write_inline(f, &**func, rodeo)?;
+            }
+            write!(f, " ")?;
+            let arg_need_paren = matches!(&**arg, ExprKind::Abs { .. } | ExprKind::If { .. } | ExprKind::Let { .. } | ExprKind::Match { .. });
+            if arg_need_paren {
+                write!(f, "(")?;
+                write_inline(f, &**arg, rodeo)?;
+                write!(f, ")")?;
+            } else {
+                write_inline(f, &**arg, rodeo)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn parexpr_inline(expr: &Expr, parent_op: &BinOp, rodeo: &Rodeo, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+    match &**expr {
+        ExprKind::BinOp { op: child_op, .. } if binop_prec(child_op) < binop_prec(parent_op) => {
+            write!(f, "(")?;
+            write_inline(f, &**expr, rodeo)?;
+            write!(f, ")")
+        }
+        _ => write_inline(f, &**expr, rodeo),
+    }
+}
+
+fn pat_write_inline(pat: &Pat, rodeo: &Rodeo, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+    match &**pat {
+        PatKind::Wildcard => f.write_str("_"),
+        PatKind::Var(ident) => f.write_str(rodeo.resolve(&ident.0)),
+        PatKind::Lit(lit) => match lit {
+            Literal::Int(n) => write!(f, "{n}"),
+            Literal::Float(v) => write!(f, "{v}"),
+            Literal::Bool(b) => f.write_str(if *b { "true" } else { "false" }),
+        },
+        PatKind::Or(a, b) => {
+            pat_write_inline(a, rodeo, f)?;
+            write!(f, " | ")?;
+            pat_write_inline(b, rodeo, f)
+        }
+    }
 }
 
 fn binop_prec(op: &BinOp) -> u8 {

@@ -675,6 +675,7 @@ dependencies = [
  "lasso",
  "logos",
  "thiserror",
+ "yansi",
 ]
 
 [[package]]
