@@ -151,7 +151,7 @@ fn write_inline(f: &mut std::fmt::Formatter, kind: &ExprKind, rodeo: &Rodeo) -> 
             Literal::Float(v) => write!(f, "{v}"),
             Literal::Bool(b) => f.write_str(if *b { "true" } else { "false" }),
         },
-        ExprKind::Var(ident) => f.write_str(rodeo.resolve(&ident.0)),
+        ExprKind::Var(ident) => f.write_str(rodeo.resolve(&ident.name)),
         ExprKind::If {
             cond,
             then_expr,
@@ -203,7 +203,7 @@ fn write_inline(f: &mut std::fmt::Formatter, kind: &ExprKind, rodeo: &Rodeo) -> 
             } else {
                 write!(f, "let ")?;
             }
-            write!(f, "{} = ", rodeo.resolve(&name.0))?;
+            write!(f, "{} = ", rodeo.resolve(&name.name))?;
             write_inline(f, &**value, rodeo)?;
             write!(f, " in ")?;
             write_inline(f, &**body, rodeo)
@@ -220,7 +220,7 @@ fn write_inline(f: &mut std::fmt::Formatter, kind: &ExprKind, rodeo: &Rodeo) -> 
             Ok(())
         }
         ExprKind::Abs { param, body } => {
-            write!(f, "|{}| ", rodeo.resolve(&param.0))?;
+            write!(f, "|{}| ", rodeo.resolve(&param.name))?;
             write_inline(f, &**body, rodeo)
         }
         ExprKind::App { func, arg } => {
@@ -260,7 +260,7 @@ fn parexpr_inline(expr: &Expr, parent_op: &BinOp, rodeo: &Rodeo, f: &mut std::fm
 fn pat_write_inline(pat: &Pat, rodeo: &Rodeo, f: &mut std::fmt::Formatter) -> std::fmt::Result {
     match &**pat {
         PatKind::Wildcard => f.write_str("_"),
-        PatKind::Var(ident) => f.write_str(rodeo.resolve(&ident.0)),
+        PatKind::Var(ident) => f.write_str(rodeo.resolve(&ident.name)),
         PatKind::Lit(lit) => match lit {
             Literal::Int(n) => write!(f, "{n}"),
             Literal::Float(v) => write!(f, "{v}"),
@@ -281,7 +281,7 @@ fn write_minimized(f: &mut std::fmt::Formatter, kind: &ExprKind, rodeo: &Rodeo) 
             Literal::Float(v) => write!(f, "{v}"),
             Literal::Bool(b) => f.write_str(if *b { "true" } else { "false" }),
         },
-        ExprKind::Var(ident) => f.write_str(rodeo.resolve(&ident.0)),
+        ExprKind::Var(ident) => f.write_str(rodeo.resolve(&ident.name)),
         ExprKind::If {
             cond,
             then_expr,
@@ -332,7 +332,7 @@ fn write_minimized(f: &mut std::fmt::Formatter, kind: &ExprKind, rodeo: &Rodeo) 
             } else {
                 write!(f, "let ")?;
             }
-            write!(f, "{} = ", rodeo.resolve(&name.0))?;
+            write!(f, "{} = ", rodeo.resolve(&name.name))?;
             write_minimized(f, &**value, rodeo)?;
             write!(f, " in ...")
         }
@@ -351,7 +351,7 @@ fn write_minimized(f: &mut std::fmt::Formatter, kind: &ExprKind, rodeo: &Rodeo) 
             Ok(())
         }
         ExprKind::Abs { param, body } => {
-            write!(f, "|{}| ", rodeo.resolve(&param.0))?;
+            write!(f, "|{}| ", rodeo.resolve(&param.name))?;
             write_minimized(f, &**body, rodeo)
         }
         ExprKind::App { func, arg } => {
@@ -427,7 +427,7 @@ impl<'bump> Visitor<'bump, PrintCtx<'_>> for AstPrinter {
                 Literal::Bool(b) => ctx.output.push_str(if *b { "true" } else { "false" }),
             },
             ExprKind::Var(ident) => {
-                ctx.output.push_str(ctx.rodeo.resolve(&ident.0));
+                ctx.output.push_str(ctx.rodeo.resolve(&ident.name));
             }
             ExprKind::If {
                 cond,
@@ -486,7 +486,7 @@ impl<'bump> Visitor<'bump, PrintCtx<'_>> for AstPrinter {
                 } else {
                     ctx.output.push_str("let ");
                 }
-                ctx.output.push_str(ctx.rodeo.resolve(&name.0));
+                ctx.output.push_str(ctx.rodeo.resolve(&name.name));
                 ctx.output.push_str(" = ");
                 ctx.indent += 1;
                 self.visit_expr(value, ctx);
@@ -514,7 +514,7 @@ impl<'bump> Visitor<'bump, PrintCtx<'_>> for AstPrinter {
             }
             ExprKind::Abs { param, body } => {
                 ctx.output.push('|');
-                ctx.output.push_str(ctx.rodeo.resolve(&param.0));
+                ctx.output.push_str(ctx.rodeo.resolve(&param.name));
                 ctx.output.push_str("| ");
                 self.visit_expr(body, ctx);
             }
@@ -529,7 +529,7 @@ impl<'bump> Visitor<'bump, PrintCtx<'_>> for AstPrinter {
     fn visit_pat(&mut self, pat: &'bump Pat<'bump>, ctx: &mut PrintCtx<'_>) {
         match &**pat {
             PatKind::Wildcard => ctx.output.push('_'),
-            PatKind::Var(ident) => ctx.output.push_str(ctx.rodeo.resolve(&ident.0)),
+            PatKind::Var(ident) => ctx.output.push_str(ctx.rodeo.resolve(&ident.name)),
             PatKind::Lit(lit) => match lit {
                 Literal::Int(n) => ctx.output.push_str(&n.to_string()),
                 Literal::Float(f) => ctx.output.push_str(&f.to_string()),

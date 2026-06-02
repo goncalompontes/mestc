@@ -1,7 +1,7 @@
 use bumpalo::Bump;
 use chumsky::span::SimpleSpan;
 use lasso::{Rodeo, Spur};
-use std::{cell::RefCell, ops::Deref, rc::Rc};
+use std::{cell::RefCell, hash::Hash, ops::Deref, rc::Rc};
 
 use crate::thunk::Thunk;
 
@@ -12,8 +12,37 @@ pub enum Literal {
     Bool(bool),
 }
 
-#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Ident(pub Spur);
+#[derive(Copy, Clone, Debug)]
+pub struct Ident {
+    pub name: Spur,
+    pub span: SimpleSpan,
+}
+
+impl Hash for Ident {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        Hash::hash(&self.name, state);
+    }
+}
+
+impl PartialEq for Ident {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+    }
+}
+
+impl Eq for Ident {}
+
+impl PartialOrd for Ident {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Ident {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.name.cmp(&other.name)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum BinOp {
@@ -289,7 +318,7 @@ impl<'bump> ExprKind<'bump> {
 
             ExprKind::Var(ident) => {
                 let thunk = env.get(ident).ok_or_else(|| {
-                    EvalError::UnboundVariable(rodeo.resolve(&ident.0).to_owned())
+                    EvalError::UnboundVariable(rodeo.resolve(&ident.name).to_owned())
                 })?;
                 Self::force(thunk, rodeo)
             }

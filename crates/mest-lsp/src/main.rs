@@ -6,5 +6,9 @@ async fn main() {
     let stdout = tokio::io::stdout();
 
     let (service, socket) = LspService::new(|client| mest_lsp::Backend::new(client));
-    Server::new(stdin, stdout, socket).serve(service).await;
+
+    tokio::select! {
+        _ = Server::new(stdin, stdout, socket).serve(service) => {},
+        _ = tokio::signal::ctrl_c() => {},
+    }
 }

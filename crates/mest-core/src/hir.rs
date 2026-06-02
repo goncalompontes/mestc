@@ -75,9 +75,17 @@ pub enum TPat<'bump> {
     Or(&'bump TPat<'bump>, &'bump TPat<'bump>),
 }
 
+const GREEK_LETTERS: &[&str] = &[
+    "α", "β", "γ", "δ", "ε", "ζ", "η", "θ", "ι", "κ", "λ", "μ",
+    "ν", "ξ", "ο", "π", "ρ", "σ", "τ", "υ", "φ", "χ", "ψ", "ω",
+];
+
 impl fmt::Display for TypeVar {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "α<{}>", self.0)
+        match GREEK_LETTERS.get(self.0 as usize) {
+            Some(name) => f.write_str(name),
+            None => write!(f, "α<{}>", self.0),
+        }
     }
 }
 

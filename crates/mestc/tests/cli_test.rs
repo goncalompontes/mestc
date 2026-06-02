@@ -282,6 +282,47 @@ fn check_match_type_error() {
     assert!(stderr.contains("Type mismatch"), "stderr: {stderr:?}");
 }
 
+// ── let rec tests ─────────────────────────────────────────────────
+
+#[test]
+fn check_rec_factorial() {
+    let path = fixture_path("check", "rec_factorial.mest");
+    let path_s = path.to_str().unwrap();
+    let (stdout, stderr, ok) = run_mest(&["check", path_s]);
+    assert!(ok, "check rec_factorial failed\nstderr: {stderr}");
+    assert!(stdout.contains(": Int"), "stdout: {stdout:?}");
+}
+
+#[test]
+fn check_rec_id() {
+    let path = fixture_path("check", "rec_id.mest");
+    let path_s = path.to_str().unwrap();
+    let (stdout, stderr, ok) = run_mest(&["check", path_s]);
+    assert!(ok, "check rec_id failed\nstderr: {stderr}");
+    assert!(stdout.contains(": Bool"), "stdout: {stdout:?}");
+}
+
+#[test]
+fn check_rec_infinite_type() {
+    let path = fixture_path("check", "rec_infinite_type.mest");
+    let path_s = path.to_str().unwrap();
+    let (stdout, stderr, ok) = run_mest(&["check", path_s]);
+    assert!(!ok, "expected infinite type error, stdout: {stdout:?}");
+    assert!(
+        stderr.contains("Occurs check failed"),
+        "stderr: {stderr:?}"
+    );
+}
+
+#[test]
+fn run_rec_factorial() {
+    let path = fixture_path("run", "rec_factorial.mest");
+    let path_s = path.to_str().unwrap();
+    let (stdout, stderr, ok) = run_mest(&["run", path_s]);
+    assert!(ok, "run rec_factorial failed\nstderr: {stderr}");
+    assert_eq!(stdout.trim(), "120");
+}
+
 // ── run command ───────────────────────────────────────────────────
 
 #[test]

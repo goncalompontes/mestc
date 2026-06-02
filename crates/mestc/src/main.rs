@@ -51,7 +51,7 @@ enum Command {
     },
 }
 
-fn run(src: &str) {
+fn run(src: &str, source_id: &str) {
     let token_iter = Token::lexer(src).spanned().map(|(tok, span)| match tok {
         Ok(tok) => (tok, span.into()),
         Err(()) => (Token::Error, span.into()),
@@ -69,17 +69,17 @@ fn run(src: &str) {
     {
         Err(errs) => {
             for err in errs {
-                Report::build(ariadne::ReportKind::Error, ((), err.span().into_range()))
+                Report::build(ariadne::ReportKind::Error, (source_id, err.span().into_range()))
                     .with_config(ariadne::Config::new().with_index_type(ariadne::IndexType::Byte))
                     .with_code(3)
                     .with_message(err.to_string())
                     .with_label(
-                        Label::new(((), err.span().into_range()))
+                        Label::new((source_id, err.span().into_range()))
                             .with_message(err.reason().to_string())
                             .with_color(Color::Red),
                     )
                     .finish()
-                    .eprint(Source::from(src))
+                    .eprint((source_id, Source::from(src)))
                     .unwrap();
             }
         }
@@ -106,7 +106,7 @@ fn lex(src: &str) {
     }
 }
 
-fn parse(src: &str) -> Result<(), ()> {
+fn parse(src: &str, source_id: &str) -> Result<(), ()> {
     let token_iter = Token::lexer(src).spanned().map(|(tok, span)| match tok {
         Ok(tok) => (tok, span.into()),
         Err(()) => (Token::Error, span.into()),
@@ -124,19 +124,19 @@ fn parse(src: &str) -> Result<(), ()> {
     {
         Err(errs) => {
             for err in errs {
-                Report::build(ariadne::ReportKind::Error, ((), err.span().into_range()))
+                Report::build(ariadne::ReportKind::Error, (source_id, err.span().into_range()))
                     .with_config(
                         ariadne::Config::new().with_index_type(ariadne::IndexType::Byte),
                     )
                     .with_code(3)
                     .with_message(err.to_string())
                     .with_label(
-                        Label::new(((), err.span().into_range()))
+                        Label::new((source_id, err.span().into_range()))
                             .with_message(err.reason().to_string())
                             .with_color(Color::Red),
                     )
                     .finish()
-                    .eprint(Source::from(src))
+                    .eprint((source_id, Source::from(src)))
                     .unwrap();
             }
             Err(())
@@ -148,7 +148,7 @@ fn parse(src: &str) -> Result<(), ()> {
     }
 }
 
-fn check(src: &str) -> Result<(), ()> {
+fn check(src: &str, source_id: &str) -> Result<(), ()> {
     let token_iter = Token::lexer(src).spanned().map(|(tok, span)| match tok {
         Ok(tok) => (tok, span.into()),
         Err(()) => (Token::Error, span.into()),
@@ -166,17 +166,17 @@ fn check(src: &str) -> Result<(), ()> {
     {
         Err(errs) => {
             for err in errs {
-                Report::build(ariadne::ReportKind::Error, ((), err.span().into_range()))
+                Report::build(ariadne::ReportKind::Error, (source_id, err.span().into_range()))
                     .with_config(ariadne::Config::new().with_index_type(ariadne::IndexType::Byte))
                     .with_code(3)
                     .with_message(err.to_string())
                     .with_label(
-                        Label::new(((), err.span().into_range()))
+                        Label::new((source_id, err.span().into_range()))
                             .with_message(err.reason().to_string())
                             .with_color(Color::Red),
                     )
                     .finish()
-                    .eprint(Source::from(src))
+                    .eprint((source_id, Source::from(src)))
                     .unwrap();
             }
             Err(())
@@ -191,8 +191,8 @@ fn check(src: &str) -> Result<(), ()> {
                 Ok(())
             } else {
                 for err in &result.errors {
-                    err.to_report()
-                        .eprint(ariadne::Source::from(src))
+                    err.to_report(source_id)
+                        .eprint((source_id, Source::from(src)))
                         .unwrap();
                 }
                 Err(())
@@ -206,12 +206,13 @@ fn main() -> Result<(), ()> {
 
     match cli.command {
         Command::Eval { expr } => {
-            run(&expr);
+            run(&expr, "<eval>");
             Ok(())
         }
         Command::Run { path } => match std::fs::read_to_string(&path) {
             Ok(src) => {
-                run(&src);
+                let source_id = path.to_string_lossy();
+                run(&src, &source_id);
                 Ok(())
             }
             Err(err) => {
@@ -224,14 +225,20 @@ fn main() -> Result<(), ()> {
             Ok(())
         }
         Command::Parse { path } => match std::fs::read_to_string(&path) {
-            Ok(src) => parse(&src),
+            Ok(src) => {
+                let source_id = path.to_string_lossy();
+                parse(&src, &source_id)
+            }
             Err(err) => {
                 eprintln!("error reading {}: {}", path.display(), err);
                 Err(())
             }
         },
         Command::Check { path } => match std::fs::read_to_string(&path) {
-            Ok(src) => check(&src),
+            Ok(src) => {
+                let source_id = path.to_string_lossy();
+                check(&src, &source_id)
+            }
             Err(err) => {
                 eprintln!("error reading {}: {}", path.display(), err);
                 Err(())

@@ -50,7 +50,10 @@ where
 {
     select! { Token::Ident(name) => name }
         .map_with(|name, e: &mut MapExtra<'_, '_, I, Extra<'tok, 'src>>| {
-            Ident(e.state().get_or_intern(name))
+            Ident {
+                name: e.state().get_or_intern(name),
+                span: e.span(),
+            }
         })
         .boxed()
 }

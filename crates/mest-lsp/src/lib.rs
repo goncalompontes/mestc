@@ -8,28 +8,36 @@ use chumsky::{Parser, input::Stream};
 use lasso::Rodeo;
 use logos::Logos;
 use mest_core::{
+    ast::ExprKind,
     hir::Type,
     parser::parser,
     token::Token,
-    typecheck::{self, InferenceTree, Output},
+    typecheck::{self, rename_type, InferenceTree, Output},
 };
+
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
 use mest_core::typecheck::Input as InferInput;
 
+struct AnnotationEntry {
+    end: usize,
+    ty: Type,
+    is_binding: bool,
+}
+
 struct AnnotationMap {
-    spans: BTreeMap<usize, (usize, Type)>,
+    spans: BTreeMap<usize, AnnotationEntry>,
 }
 
 impl AnnotationMap {
-    fn find_entry(&self, offset: usize) -> Option<(usize, usize, Type)> {
+    fn find_entry(&self, offset: usize) -> Option<(usize, usize, Type, bool)> {
         self.spans
             .range(..=offset)
-            .filter(|(_, (end, _))| offset < *end)
-            .min_by_key(|(start, (end, _))| *end - *start)
-            .map(|(start, (end, ty))| (*start, *end, ty.clone()))
+            .filter(|(_, e)| offset < e.end)
+            .min_by_key(|(start, e)| e.end - *start)
+            .map(|(start, e)| (*start, e.end, e.ty.clone(), e.is_binding))
     }
 }
 
@@ -101,7 +109,30 @@ fn collect_infer_nodes(tree: &InferenceTree, map: &mut AnnotationMap) {
     if let InferInput::Infer { expr, .. } = &tree.input {
         if let Output::Type(ty) = &tree.output {
             let range: std::ops::Range<usize> = expr.span.into_range();
-            map.spans.insert(range.start, (range.end, ty.clone()));
+            map.spans.insert(range.start, AnnotationEntry { end: range.end, ty: rename_type(ty), is_binding: false });
+
+            match &*expr.kind {
+                ExprKind::Let { name, .. } => {
+                    if let Some(first_child) = tree.children.first() {
+                        if let Output::Type(val_ty) = &first_child.output {
+                            let ident_range: std::ops::Range<usize> = name.span.into_range();
+                            map.spans.insert(ident_range.start, AnnotationEntry { end: ident_range.end, ty: rename_type(val_ty), is_binding: true });
+                        }
+                    }
+                }
+                ExprKind::Abs { param, .. } => {
+                    if let Output::Type(ty) = &tree.output {
+                        if let Type::Arrow(_, _) = ty {
+                            let renamed = rename_type(ty);
+                            if let Type::Arrow(param_ty, _) = &renamed {
+                                let ident_range: std::ops::Range<usize> = param.span.into_range();
+                                map.spans.insert(ident_range.start, AnnotationEntry { end: ident_range.end, ty: (**param_ty).clone(), is_binding: true });
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
     }
     for child in &tree.children {
@@ -110,13 +141,24 @@ fn collect_infer_nodes(tree: &InferenceTree, map: &mut AnnotationMap) {
 }
 
 impl Backend {
-    fn schedule_update(&self, uri: Url, text: String, generation: u64) {
+    fn schedule_update(&self, uri: Url, generation: u64) {
         let documents = self.documents.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(300)).await;
 
-            let annotations = build_annotations(&text);
+            let (text, gen_id) = {
+                let docs = documents.lock().unwrap();
+                match docs.get(&uri) {
+                    Some(doc) => (doc.text.clone(), doc.generation),
+                    None => return,
+                }
+            };
 
+            if gen_id != generation {
+                return;
+            }
+
+            let annotations = build_annotations(&text);
             let mut docs = documents.lock().unwrap();
             if let Some(doc) = docs.get_mut(&uri) {
                 if doc.generation == generation {
@@ -172,7 +214,7 @@ impl LanguageServer for Backend {
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri;
-        let text = params.content_changes.into_iter().last().unwrap().text;
+        let new_text = params.content_changes.into_iter().last().unwrap().text;
 
         let gen_id = {
             let mut docs = self.documents.lock().unwrap();
@@ -181,12 +223,12 @@ impl LanguageServer for Backend {
                 generation: 0,
                 annotations: None,
             });
-            doc.text = text.clone();
+            doc.text = new_text.clone();
             doc.generation += 1;
             doc.generation
         };
 
-        self.schedule_update(uri, text, gen_id);
+        self.schedule_update(uri, gen_id);
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -217,7 +259,7 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
 
-        let (range_start, range_end, ty_str) = {
+        let ty_str = {
             let docs = self.documents.lock().unwrap();
             let doc = match docs.get(&uri) {
                 Some(doc) => doc,
@@ -228,10 +270,24 @@ impl LanguageServer for Backend {
                 None => return Ok(None),
             };
             match annotations.find_entry(offset) {
-                Some((start, end, ty)) => (start, end, ty.to_string()),
+                Some((_, _, ty, _)) => ty.to_string(),
                 None => return Ok(None),
             }
         };
+
+        let word_at = |offset: usize| -> (usize, usize) {
+            let start = text[..offset]
+                .rfind(|c: char| !c.is_alphanumeric() && c != '_')
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            let end = text[offset..]
+                .find(|c: char| !c.is_alphanumeric() && c != '_')
+                .map(|i| offset + i)
+                .unwrap_or(text.len());
+            (start, end)
+        };
+
+        let (word_start, word_end) = word_at(offset);
 
         Ok(Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
@@ -239,8 +295,8 @@ impl LanguageServer for Backend {
                 value: format!("```mest\n: {}\n```", ty_str),
             }),
             range: Some(Range {
-                start: offset_to_lsp(&text, range_start),
-                end: offset_to_lsp(&text, range_end),
+                start: offset_to_lsp(&text, word_start),
+                end: offset_to_lsp(&text, word_end),
             }),
         }))
     }
@@ -271,11 +327,12 @@ impl LanguageServer for Backend {
             let result: Vec<_> = annotations
                 .spans
                 .iter()
-                .filter(|(_, (end, _))| {
-                    let pos = offset_to_lsp(&doc.text, *end);
+                .filter(|(_, e)| e.is_binding)
+                .filter(|(_, e)| {
+                    let pos = offset_to_lsp(&doc.text, e.end);
                     pos.line >= range.start.line && pos.line <= range.end.line
                 })
-                .map(|(start, (end, ty))| (*start, *end, ty.clone()))
+                .map(|(start, e)| (*start, e.end, e.ty.clone()))
                 .collect();
             result
         };
