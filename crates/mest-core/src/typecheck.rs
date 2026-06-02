@@ -166,6 +166,30 @@ impl std::fmt::Display for RuleName {
     }
 }
 
+pub struct Theme {
+    pub rule: yansi::Style,
+    pub rule_error: yansi::Style,
+    pub ty: yansi::Style,
+    pub op: yansi::Style,
+    pub expr: yansi::Style,
+    pub error: yansi::Style,
+    pub max_expr_len: usize,
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Self {
+            rule: yansi::Style::new().bold().fg(yansi::Color::Yellow),
+            rule_error: yansi::Style::new().bold().fg(yansi::Color::Red),
+            ty: yansi::Style::new().bold().fg(yansi::Color::White),
+            op: yansi::Style::new(),
+            expr: yansi::Style::new().fg(yansi::Color::BrightBlack),
+            error: yansi::Style::new().fg(yansi::Color::Red),
+            max_expr_len: 50,
+        }
+    }
+}
+
 pub enum Input<'a> {
     Infer { env: String, expr: &'a Expr<'a> },
     Unify { left: Type, right: Type },
@@ -217,46 +241,51 @@ impl<'a> InferenceTree<'a> {
         }
     }
 
-    pub fn display_tree(&self, rodeo: &Rodeo) -> String {
+    pub fn display_tree(&self, theme: &Theme, rodeo: &Rodeo) -> String {
         let mut buf = String::new();
-        self.write(&mut buf, &[], rodeo);
+        self.write(&mut buf, theme, &[], rodeo);
         buf
     }
 
-    fn write(&self, buf: &mut String, prefix: &[bool], rodeo: &Rodeo) {
+    fn write(&self, buf: &mut String, theme: &Theme, prefix: &[bool], rodeo: &Rodeo) {
         use std::fmt::Write;
         use yansi::Paint;
 
         for &is_last in prefix.iter().take(prefix.len().saturating_sub(1)) {
             let ch = if is_last { "    " } else { "│   " };
-            let _ = write!(buf, "{}", ch.dim());
+            let _ = write!(buf, "{ch}");
         }
         if let Some(&last) = prefix.last() {
             let ch = if last { "└── " } else { "├── " };
-            let _ = write!(buf, "{}", ch.dim());
+            let _ = write!(buf, "{ch}");
         }
 
         if self.rule == RuleName::TError {
-            let _ = write!(buf, "{}", self.rule.to_string().red().bold());
+            let _ = write!(buf, "{}", self.rule.to_string().paint(theme.rule_error));
         } else {
-            let _ = write!(buf, "{}", self.rule.to_string().cyan().bold());
+            let _ = write!(buf, "{}", self.rule.to_string().paint(theme.rule));
         }
         let _ = write!(buf, " ");
 
         match &self.input {
             Input::Infer { env, expr } => {
-                let _ = write!(buf, "{}", env.yellow());
-                let _ = write!(buf, "{}", " ⊢ ".yellow());
-                let _ = write!(buf, "{}", expr.display_inline(rodeo).yellow());
-                let _ = write!(buf, "{}", " ⇒".yellow());
+                let _ = write!(buf, "{}", env.paint(theme.expr));
+                let _ = write!(buf, "{}", " ⊢ ".paint(theme.op));
+                let full = expr.display_inline(rodeo).to_string();
+                if full.len() > theme.max_expr_len {
+                    let _ = write!(buf, "{}", expr.display_minimized(rodeo).paint(theme.expr));
+                } else {
+                    let _ = write!(buf, "{}", full.paint(theme.expr));
+                }
+                let _ = write!(buf, "{}", " ⇒".paint(theme.op));
             }
             Input::Unify { left, right } => {
-                let _ = write!(buf, "{}", format!("{}", left).yellow());
-                let _ = write!(buf, "{}", " ~ ".yellow());
-                let _ = write!(buf, "{}", format!("{}", right).yellow());
+                let _ = write!(buf, "{}", format!("{}", left).paint(theme.ty));
+                let _ = write!(buf, "{}", " ~ ".paint(theme.op));
+                let _ = write!(buf, "{}", format!("{}", right).paint(theme.ty));
             }
             Input::Pat(s) => {
-                let _ = write!(buf, "{}", s.yellow());
+                let _ = write!(buf, "{}", s.paint(theme.expr));
             }
         }
         let _ = write!(buf, " ");
@@ -264,16 +293,16 @@ impl<'a> InferenceTree<'a> {
         match &self.output {
             Output::Type(ty) => {
                 if self.rule == RuleName::TError {
-                    let _ = write!(buf, "{}", format!("{}", ty).red());
+                    let _ = write!(buf, "{}", format!("{}", ty).paint(theme.error));
                 } else {
-                    let _ = write!(buf, "{}", format!("{}", ty).yellow());
+                    let _ = write!(buf, "{}", format!("{}", ty).paint(theme.ty));
                 }
             }
             Output::Str(s) => {
                 if self.rule == RuleName::TError {
-                    let _ = write!(buf, "{}", s.red());
+                    let _ = write!(buf, "{}", s.paint(theme.error));
                 } else {
-                    let _ = write!(buf, "{}", s.yellow());
+                    let _ = write!(buf, "{s}");
                 }
             }
         }
@@ -283,7 +312,7 @@ impl<'a> InferenceTree<'a> {
             let is_last = i == self.children.len() - 1;
             let mut child_prefix = prefix.to_vec();
             child_prefix.push(is_last);
-            child.write(buf, &child_prefix, rodeo);
+            child.write(buf, theme, &child_prefix, rodeo);
         }
     }
 }
@@ -411,7 +440,12 @@ impl<'rodeo> TypeInference<'rodeo> {
             .collect()
     }
 
-    fn unify<'tree>(&mut self, this: &Type, other: &Type, span: SimpleSpan) -> (Subst, InferenceTree<'tree>) {
+    fn unify<'tree>(
+        &mut self,
+        this: &Type,
+        other: &Type,
+        span: SimpleSpan,
+    ) -> (Subst, InferenceTree<'tree>) {
         let error = |this: &'_ Type, other: &'_ Type, msg: &str| {
             let tree = InferenceTree::new(
                 RuleName::TError,
@@ -542,8 +576,8 @@ impl<'rodeo> TypeInference<'rodeo> {
             _ => {
                 self.emit_error(InferenceError::UnificationFailure {
                     span,
-                    expected: this.clone(),
-                    actual: other.clone(),
+                    expected: other.clone(),
+                    actual: this.clone(),
                 });
                 error(this, other, "type mismatch")
             }
@@ -573,17 +607,19 @@ impl<'rodeo> TypeInference<'rodeo> {
         }
     }
 
-    fn infer_var<'a>(&mut self, env: &Env, expr: &'a Expr<'a>, name: Ident) -> (Subst, Type, InferenceTree<'a>) {
+    fn infer_var<'a>(
+        &mut self,
+        env: &Env,
+        expr: &'a Expr<'a>,
+        name: Ident,
+    ) -> (Subst, Type, InferenceTree<'a>) {
         let env_str = self.pretty_env(env);
         match env.get(&name) {
             Some(scheme) => {
                 let instantiated = self.instantiate(scheme);
                 let tree = InferenceTree::new(
                     RuleName::TVar,
-                    Input::Infer {
-                        env: env_str,
-                        expr,
-                    },
+                    Input::Infer { env: env_str, expr },
                     instantiated.clone(),
                     vec![],
                 );
@@ -597,10 +633,7 @@ impl<'rodeo> TypeInference<'rodeo> {
                 self.emit_error(err);
                 let tree = InferenceTree::new(
                     RuleName::TError,
-                    Input::Infer {
-                        env: env_str,
-                        expr,
-                    },
+                    Input::Infer { env: env_str, expr },
                     "unbound variable",
                     vec![],
                 );
@@ -634,10 +667,7 @@ impl<'rodeo> TypeInference<'rodeo> {
 
         let tree = InferenceTree::new(
             RuleName::TAbs,
-            Input::Infer {
-                env: env_str,
-                expr,
-            },
+            Input::Infer { env: env_str, expr },
             result_ty.clone(),
             vec![tree1],
         );
@@ -669,10 +699,7 @@ impl<'rodeo> TypeInference<'rodeo> {
 
         let tree = InferenceTree::new(
             RuleName::TApp,
-            Input::Infer {
-                env: env_str,
-                expr,
-            },
+            Input::Infer { env: env_str, expr },
             final_ty.clone(),
             vec![tree1, tree2, tree3],
         );
@@ -701,10 +728,7 @@ impl<'rodeo> TypeInference<'rodeo> {
         let final_subst = s2.compose(&s1);
         let tree = InferenceTree::new(
             RuleName::TLet,
-            Input::Infer {
-                env: env_str,
-                expr,
-            },
+            Input::Infer { env: env_str, expr },
             body_ty.clone(),
             vec![tree1, tree2],
         );
@@ -739,10 +763,7 @@ impl<'rodeo> TypeInference<'rodeo> {
 
         let tree = InferenceTree::new(
             RuleName::TIf,
-            Input::Infer {
-                env: env_str,
-                expr,
-            },
+            Input::Infer { env: env_str, expr },
             final_ty.clone(),
             vec![tree1, tree2, tree3, cond_tree, eq_tree],
         );
@@ -784,10 +805,7 @@ impl<'rodeo> TypeInference<'rodeo> {
 
         let tree = InferenceTree::new(
             RuleName::TBinOp,
-            Input::Infer {
-                env: env_str,
-                expr,
-            },
+            Input::Infer { env: env_str, expr },
             final_ty.clone(),
             vec![tree1, tree2, lhs_tree, rhs_tree],
         );
@@ -817,21 +835,26 @@ impl<'rodeo> TypeInference<'rodeo> {
 
         let tree = InferenceTree::new(
             RuleName::TUnaryOp,
-            Input::Infer {
-                env: env_str,
-                expr,
-            },
+            Input::Infer { env: env_str, expr },
             final_ty.clone(),
             vec![tree1, rhs_tree],
         );
         (final_subst, final_ty, tree)
     }
 
-    fn infer_pat<'a>(&mut self, pat: &'a Pat<'a>) -> (Type, Vec<(Ident, Scheme)>, InferenceTree<'a>) {
+    fn infer_pat<'a>(
+        &mut self,
+        pat: &'a Pat<'a>,
+    ) -> (Type, Vec<(Ident, Scheme)>, InferenceTree<'a>) {
         match &**pat {
             PatKind::Wildcard => {
                 let ty = Type::Var(self.fresh_tyvar());
-                let tree = InferenceTree::new(RuleName::TPatWild, Input::Pat("_".into()), ty.clone(), vec![]);
+                let tree = InferenceTree::new(
+                    RuleName::TPatWild,
+                    Input::Pat("_".into()),
+                    ty.clone(),
+                    vec![],
+                );
                 (ty, vec![], tree)
             }
             PatKind::Var(ident) => {
@@ -841,7 +864,8 @@ impl<'rodeo> TypeInference<'rodeo> {
                     ty: ty.clone(),
                 };
                 let name = self.rodeo.resolve(&ident.0).to_owned();
-                let tree = InferenceTree::new(RuleName::TPatVar, Input::Pat(name), ty.clone(), vec![]);
+                let tree =
+                    InferenceTree::new(RuleName::TPatVar, Input::Pat(name), ty.clone(), vec![]);
                 (ty, vec![(*ident, scheme)], tree)
             }
             PatKind::Lit(lit) => {
@@ -855,7 +879,8 @@ impl<'rodeo> TypeInference<'rodeo> {
                     Literal::Float(f) => f.to_string(),
                     Literal::Bool(b) => b.to_string(),
                 };
-                let tree = InferenceTree::new(RuleName::TPatLit, Input::Pat(lit_str), ty.clone(), vec![]);
+                let tree =
+                    InferenceTree::new(RuleName::TPatLit, Input::Pat(lit_str), ty.clone(), vec![]);
                 (ty, vec![], tree)
             }
             PatKind::Or(a, b) => {
@@ -949,10 +974,7 @@ impl<'rodeo> TypeInference<'rodeo> {
                 self.emit_error(InferenceError::NoMatchArms { span: expr.span });
                 let tree = InferenceTree::new(
                     RuleName::TMatch,
-                    Input::Infer {
-                        env: env_str,
-                        expr,
-                    },
+                    Input::Infer { env: env_str, expr },
                     Type::Never,
                     arm_trees,
                 );
@@ -962,10 +984,7 @@ impl<'rodeo> TypeInference<'rodeo> {
 
         let tree = InferenceTree::new(
             RuleName::TMatch,
-            Input::Infer {
-                env: env_str,
-                expr,
-            },
+            Input::Infer { env: env_str, expr },
             final_ty.clone(),
             arm_trees,
         );
@@ -979,18 +998,15 @@ impl<'rodeo> TypeInference<'rodeo> {
         literal: &Literal,
     ) -> (Subst, Type, InferenceTree<'a>) {
         let env_str = self.pretty_env(env);
-        let (rule, output, ty) = match literal {
-            Literal::Int(_) => (RuleName::TInt, "Int", Type::Int),
-            Literal::Float(_) => (RuleName::TFloat, "Float", Type::Float),
-            Literal::Bool(_) => (RuleName::TBool, "Bool", Type::Bool),
+        let (rule, ty) = match literal {
+            Literal::Int(_) => (RuleName::TInt, Type::Int),
+            Literal::Float(_) => (RuleName::TFloat, Type::Float),
+            Literal::Bool(_) => (RuleName::TBool, Type::Bool),
         };
         let tree = InferenceTree::new(
             rule,
-            Input::Infer {
-                env: env_str,
-                expr,
-            },
-            output,
+            Input::Infer { env: env_str, expr },
+            ty.clone(),
             vec![],
         );
         (Subst::empty(), ty, tree)

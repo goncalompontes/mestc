@@ -112,6 +112,21 @@ impl<'bump> Expr<'bump> {
     pub fn display_inline<'a>(&'bump self, rodeo: &'a Rodeo) -> InlineDisplay<'a, 'bump> {
         InlineDisplay { expr: self, rodeo }
     }
+
+    pub fn display_minimized<'a>(&'bump self, rodeo: &'a Rodeo) -> SimplifiedDisplay<'a, 'bump> {
+        SimplifiedDisplay { expr: self, rodeo }
+    }
+}
+
+pub struct SimplifiedDisplay<'a, 'bump> {
+    expr: &'bump Expr<'bump>,
+    rodeo: &'a Rodeo,
+}
+
+impl std::fmt::Display for SimplifiedDisplay<'_, '_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write_minimized(f, &**self.expr, self.rodeo)
+    }
 }
 
 fn indent(level: usize) -> String {
@@ -255,6 +270,94 @@ fn pat_write_inline(pat: &Pat, rodeo: &Rodeo, f: &mut std::fmt::Formatter) -> st
             pat_write_inline(a, rodeo, f)?;
             write!(f, " | ")?;
             pat_write_inline(b, rodeo, f)
+        }
+    }
+}
+
+fn write_minimized(f: &mut std::fmt::Formatter, kind: &ExprKind, rodeo: &Rodeo) -> std::fmt::Result {
+    match kind {
+        ExprKind::Literal(lit) => match lit {
+            Literal::Int(n) => write!(f, "{n}"),
+            Literal::Float(v) => write!(f, "{v}"),
+            Literal::Bool(b) => f.write_str(if *b { "true" } else { "false" }),
+        },
+        ExprKind::Var(ident) => f.write_str(rodeo.resolve(&ident.0)),
+        ExprKind::If {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            write!(f, "if ")?;
+            write_minimized(f, &**cond, rodeo)?;
+            write!(f, " then ")?;
+            write_minimized(f, &**then_expr, rodeo)?;
+            write!(f, " else ")?;
+            write_minimized(f, &**else_expr, rodeo)
+        }
+        ExprKind::BinOp { op, lhs, rhs } => {
+            write_minimized(f, &**lhs, rodeo)?;
+            let op_str = match op {
+                BinOp::Eq => " == ",
+                BinOp::NotEq => " != ",
+                BinOp::Lt => " < ",
+                BinOp::Gt => " > ",
+                BinOp::Le => " <= ",
+                BinOp::Ge => " >= ",
+                BinOp::And => " && ",
+                BinOp::Or => " || ",
+                BinOp::Add => " + ",
+                BinOp::Sub => " - ",
+                BinOp::Mul => " * ",
+                BinOp::Div => " / ",
+                BinOp::Pow => " ^ ",
+            };
+            f.write_str(op_str)?;
+            write_minimized(f, &**rhs, rodeo)
+        }
+        ExprKind::UnaryOp { op, rhs } => {
+            match op {
+                UnaryOp::Neg => f.write_str("-")?,
+                UnaryOp::Not => f.write_str("!")?,
+            }
+            write_minimized(f, &**rhs, rodeo)
+        }
+        ExprKind::Let {
+            name,
+            value,
+            rec,
+            ..
+        } => {
+            if *rec {
+                write!(f, "let rec ")?;
+            } else {
+                write!(f, "let ")?;
+            }
+            write!(f, "{} = ", rodeo.resolve(&name.0))?;
+            write_minimized(f, &**value, rodeo)?;
+            write!(f, " in ...")
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            write!(f, "match ")?;
+            write_minimized(f, &**scrutinee, rodeo)?;
+            if let Some((pat, body)) = arms.first() {
+                write!(f, " | ")?;
+                pat_write_inline(pat, rodeo, f)?;
+                write!(f, " => ")?;
+                write_minimized(f, &**body, rodeo)?;
+            }
+            if arms.len() > 1 {
+                write!(f, " | ...")?;
+            }
+            Ok(())
+        }
+        ExprKind::Abs { param, body } => {
+            write!(f, "|{}| ", rodeo.resolve(&param.0))?;
+            write_minimized(f, &**body, rodeo)
+        }
+        ExprKind::App { func, arg } => {
+            write_minimized(f, &**func, rodeo)?;
+            write!(f, " ")?;
+            write_minimized(f, &**arg, rodeo)
         }
     }
 }
