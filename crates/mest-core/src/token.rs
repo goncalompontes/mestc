@@ -21,6 +21,8 @@ pub enum Token<'a> {
     False,
     #[token("match")]
     Match,
+    #[token("and")]
+    And,
 
     #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice())]
     Ident(&'a str),
@@ -74,6 +76,8 @@ pub enum Token<'a> {
     LParen,
     #[token(")")]
     RParen,
+    #[token(",")]
+    Comma,
     #[token("=>")]
     StrongArrow,
 
@@ -118,6 +122,8 @@ impl Display for Token<'_> {
             Token::WhiteSpace => write!(f, "<whitespace>"),
             Token::Error => write!(f, "<error>"),
             Token::Match => write!(f, "match"),
+            Token::And => write!(f, "and"),
+            Token::Comma => write!(f, ","),
             Token::StrongArrow => write!(f, "=>"),
         }
     }
