@@ -21,10 +21,13 @@ use tower_lsp::{Client, LanguageServer};
 
 use mest_core::typecheck::Input as InferInput;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BindingKind { Let, Param, NotBinding }
+
 struct AnnotationEntry {
     end: usize,
     ty: Type,
-    is_binding: bool,
+    kind: BindingKind,
 }
 
 struct AnnotationMap {
@@ -32,12 +35,12 @@ struct AnnotationMap {
 }
 
 impl AnnotationMap {
-    fn find_entry(&self, offset: usize) -> Option<(usize, usize, Type, bool)> {
+    fn find_entry(&self, offset: usize) -> Option<(usize, usize, Type, BindingKind)> {
         self.spans
             .range(..=offset)
             .filter(|(_, e)| offset < e.end)
             .min_by_key(|(start, e)| e.end - *start)
-            .map(|(start, e)| (*start, e.end, e.ty.clone(), e.is_binding))
+            .map(|(start, e)| (*start, e.end, e.ty.clone(), e.kind))
     }
 }
 
@@ -109,14 +112,14 @@ fn collect_infer_nodes(tree: &InferenceTree, map: &mut AnnotationMap) {
     if let InferInput::Infer { expr, .. } = &tree.input {
         if let Output::Type(ty) = &tree.output {
             let range: std::ops::Range<usize> = expr.span.into_range();
-            map.spans.insert(range.start, AnnotationEntry { end: range.end, ty: rename_type(ty), is_binding: false });
+            map.spans.insert(range.start, AnnotationEntry { end: range.end, ty: rename_type(ty), kind: BindingKind::NotBinding });
 
             match &*expr.kind {
                 ExprKind::Let { name, .. } => {
                     if let Some(first_child) = tree.children.first() {
                         if let Output::Type(val_ty) = &first_child.output {
                             let ident_range: std::ops::Range<usize> = name.span.into_range();
-                            map.spans.insert(ident_range.start, AnnotationEntry { end: ident_range.end, ty: rename_type(val_ty), is_binding: true });
+                            map.spans.insert(ident_range.start, AnnotationEntry { end: ident_range.end, ty: rename_type(val_ty), kind: BindingKind::Let });
                         }
                     }
                 }
@@ -126,7 +129,7 @@ fn collect_infer_nodes(tree: &InferenceTree, map: &mut AnnotationMap) {
                             let renamed = rename_type(ty);
                             if let Type::Arrow(param_ty, _) = &renamed {
                                 let ident_range: std::ops::Range<usize> = param.span.into_range();
-                                map.spans.insert(ident_range.start, AnnotationEntry { end: ident_range.end, ty: (**param_ty).clone(), is_binding: true });
+                                map.spans.insert(ident_range.start, AnnotationEntry { end: ident_range.end, ty: (**param_ty).clone(), kind: BindingKind::Param });
                             }
                         }
                     }
@@ -259,7 +262,7 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
 
-        let ty_str = {
+        let (ty_str, kind) = {
             let docs = self.documents.lock().unwrap();
             let doc = match docs.get(&uri) {
                 Some(doc) => doc,
@@ -270,7 +273,7 @@ impl LanguageServer for Backend {
                 None => return Ok(None),
             };
             match annotations.find_entry(offset) {
-                Some((_, _, ty, _)) => ty.to_string(),
+                Some((_, _, ty, kind)) => (ty.to_string(), kind),
                 None => return Ok(None),
             }
         };
@@ -288,11 +291,18 @@ impl LanguageServer for Backend {
         };
 
         let (word_start, word_end) = word_at(offset);
+        let word = &text[word_start..word_end];
+
+        let hover_value = match kind {
+            BindingKind::Let => format!("```mest\nlet {}: {}\n```", word, ty_str),
+            BindingKind::Param => format!("```mest\n{}: {}\n```", word, ty_str),
+            BindingKind::NotBinding => format!("```mest\n: {}\n```", ty_str),
+        };
 
         Ok(Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
                 kind: MarkupKind::Markdown,
-                value: format!("```mest\n: {}\n```", ty_str),
+                value: hover_value,
             }),
             range: Some(Range {
                 start: offset_to_lsp(&text, word_start),
@@ -327,7 +337,7 @@ impl LanguageServer for Backend {
             let result: Vec<_> = annotations
                 .spans
                 .iter()
-                .filter(|(_, e)| e.is_binding)
+                .filter(|(_, e)| e.kind == BindingKind::Let || e.kind == BindingKind::Param)
                 .filter(|(_, e)| {
                     let pos = offset_to_lsp(&doc.text, e.end);
                     pos.line >= range.start.line && pos.line <= range.end.line
@@ -343,7 +353,7 @@ impl LanguageServer for Backend {
                 let pos = offset_to_lsp(&text, end);
                 InlayHint {
                     position: pos,
-                    label: InlayHintLabel::String(format!(": {}", ty)),
+                    label: InlayHintLabel::String(format!(":{}", ty)),
                     kind: Some(InlayHintKind::TYPE),
                     padding_left: Some(true),
                     padding_right: None,
