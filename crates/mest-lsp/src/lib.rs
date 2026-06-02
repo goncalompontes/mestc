@@ -8,7 +8,7 @@ use chumsky::{Parser, input::Stream};
 use lasso::Rodeo;
 use logos::Logos;
 use mest_core::{
-    ast::ExprKind,
+    ast::{ExprKind, PatKind},
     hir::Type,
     parser::parser,
     token::Token,
@@ -115,21 +115,25 @@ fn collect_infer_nodes(tree: &InferenceTree, map: &mut AnnotationMap) {
             map.spans.insert(range.start, AnnotationEntry { end: range.end, ty: rename_type(ty), kind: BindingKind::NotBinding });
 
             match &*expr.kind {
-                ExprKind::Let { name, .. } => {
-                    if let Some(first_child) = tree.children.first() {
-                        if let Output::Type(val_ty) = &first_child.output {
-                            let ident_range: std::ops::Range<usize> = name.span.into_range();
-                            map.spans.insert(ident_range.start, AnnotationEntry { end: ident_range.end, ty: rename_type(val_ty), kind: BindingKind::Let });
+                ExprKind::Let { bindings, .. } => {
+                    for (i, (name, _)) in bindings.iter().enumerate() {
+                        if let Some(child) = tree.children.get(i) {
+                            if let Output::Type(val_ty) = &child.output {
+                                let ident_range: std::ops::Range<usize> = name.span.into_range();
+                                map.spans.insert(ident_range.start, AnnotationEntry { end: ident_range.end, ty: rename_type(val_ty), kind: BindingKind::Let });
+                            }
                         }
                     }
                 }
                 ExprKind::Abs { param, .. } => {
                     if let Output::Type(ty) = &tree.output {
                         if let Type::Arrow(_, _) = ty {
-                            let renamed = rename_type(ty);
-                            if let Type::Arrow(param_ty, _) = &renamed {
-                                let ident_range: std::ops::Range<usize> = param.span.into_range();
-                                map.spans.insert(ident_range.start, AnnotationEntry { end: ident_range.end, ty: (**param_ty).clone(), kind: BindingKind::Param });
+                            if matches!(*param.kind, PatKind::Var(_)) {
+                                let renamed = rename_type(ty);
+                                if let Type::Arrow(param_ty, _) = &renamed {
+                                    let ident_range: std::ops::Range<usize> = param.span.into_range();
+                                    map.spans.insert(ident_range.start, AnnotationEntry { end: ident_range.end, ty: (**param_ty).clone(), kind: BindingKind::Param });
+                                }
                             }
                         }
                     }
