@@ -250,7 +250,7 @@ fn check_type_error() {
     let (stdout, stderr, ok) = run_mest(&["check", path_s]);
     assert!(!ok, "expected type error to fail, stdout: {stdout:?}");
     assert!(
-        stderr.contains("type inference failed"),
+        stderr.contains("Type mismatch"),
         "stderr: {stderr:?}"
     );
 }
@@ -261,7 +261,7 @@ fn check_type_mismatch_binop() {
     let path_s = path.to_str().unwrap();
     let (stdout, stderr, ok) = run_mest(&["check", path_s]);
     assert!(!ok, "expected type error, stdout: {stdout:?}");
-    assert!(stderr.contains("type inference failed"), "stderr: {stderr:?}");
+    assert!(stderr.contains("Type mismatch"), "stderr: {stderr:?}");
 }
 
 #[test]
@@ -270,7 +270,7 @@ fn check_let_poly_type_error() {
     let path_s = path.to_str().unwrap();
     let (stdout, stderr, ok) = run_mest(&["check", path_s]);
     assert!(!ok, "expected type error, stdout: {stdout:?}");
-    assert!(stderr.contains("type inference failed"), "stderr: {stderr:?}");
+    assert!(stderr.contains("Type mismatch"), "stderr: {stderr:?}");
 }
 
 #[test]
@@ -279,7 +279,7 @@ fn check_match_type_error() {
     let path_s = path.to_str().unwrap();
     let (stdout, stderr, ok) = run_mest(&["check", path_s]);
     assert!(!ok, "expected type error, stdout: {stdout:?}");
-    assert!(stderr.contains("type inference failed"), "stderr: {stderr:?}");
+    assert!(stderr.contains("Type mismatch"), "stderr: {stderr:?}");
 }
 
 // ── run command ───────────────────────────────────────────────────

@@ -17,6 +17,8 @@ pub enum Type {
     Float,
     Bool,
     Tuple(Vec<Type>),
+    Error,
+    Never,
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +90,8 @@ impl fmt::Display for Type {
             Type::Float => write!(f, "Float"),
             Type::Bool => write!(f, "Bool"),
             Type::Tuple(items) => write!(f, "({})", items.iter().format(",")),
+            Type::Error => write!(f, "<error>"),
+            Type::Never => write!(f, "Never"),
         }
     }
 }

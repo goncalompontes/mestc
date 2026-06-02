@@ -1,4 +1,4 @@
-use crate::ast::{BinOp, Expr, ExprKind, Literal, Pat, UnaryOp};
+use crate::ast::{BinOp, Expr, ExprKind, Literal, Pat, PatKind, UnaryOp};
 use lasso::Rodeo;
 
 pub trait Visitor<'bump, Ctx>: Sized {
@@ -54,9 +54,9 @@ pub trait Visitor<'bump, Ctx>: Sized {
 
     fn walk_pat(&mut self, pat: &'bump Pat<'bump>, ctx: &mut Ctx) {
         self.visit_pat(pat, ctx);
-        match pat {
-            Pat::Wildcard | Pat::Var(_) | Pat::Lit(_) => {}
-            Pat::Or(a, b) => {
+        match &**pat {
+            PatKind::Wildcard | PatKind::Var(_) | PatKind::Lit(_) => {}
+            PatKind::Or(a, b) => {
                 self.walk_pat(a, ctx);
                 self.walk_pat(b, ctx);
             }
@@ -279,15 +279,15 @@ impl<'bump> Visitor<'bump, PrintCtx<'_>> for AstPrinter {
     }
 
     fn visit_pat(&mut self, pat: &'bump Pat<'bump>, ctx: &mut PrintCtx<'_>) {
-        match pat {
-            Pat::Wildcard => ctx.output.push('_'),
-            Pat::Var(ident) => ctx.output.push_str(ctx.rodeo.resolve(&ident.0)),
-            Pat::Lit(lit) => match lit {
+        match &**pat {
+            PatKind::Wildcard => ctx.output.push('_'),
+            PatKind::Var(ident) => ctx.output.push_str(ctx.rodeo.resolve(&ident.0)),
+            PatKind::Lit(lit) => match lit {
                 Literal::Int(n) => ctx.output.push_str(&n.to_string()),
                 Literal::Float(f) => ctx.output.push_str(&f.to_string()),
                 Literal::Bool(b) => ctx.output.push_str(if *b { "true" } else { "false" }),
             },
-            Pat::Or(a, b) => {
+            PatKind::Or(a, b) => {
                 self.visit_pat(a, ctx);
                 ctx.output.push_str(" | ");
                 self.visit_pat(b, ctx);

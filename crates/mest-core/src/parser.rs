@@ -13,7 +13,7 @@ use chumsky::{
 use lasso::Rodeo;
 
 use crate::{
-    ast::{BinOp, ExprKind, Expr, Ident, Literal, Pat, UnaryOp},
+    ast::{BinOp, ExprKind, Expr, Ident, Literal, Pat, PatKind, UnaryOp},
     token::Token,
 };
 
@@ -70,23 +70,36 @@ where
         .boxed()
 }
 
-fn pat_parser<'tok, 'src, 'bump, I>() -> BoxedParser<'tok, 'src, 'bump, I, Pat<'bump>>
+fn pat_parser<'tok, 'src, 'bump, I>(
+    bump: &'bump Bump,
+) -> BoxedParser<'tok, 'src, 'bump, I, Pat<'bump>>
 where
     I: ValueInput<'tok, Token = Token<'src>, Span = SimpleSpan>,
     'src: 'tok,
     'bump: 'tok,
 {
     let wildcard = just(Token::Ident("_"))
-        .map_with(|_, _: &mut MapExtra<'_, '_, I, Extra<'tok, 'src>>| Pat::Wildcard);
+        .map_with(|_, e: &mut MapExtra<'_, '_, I, Extra<'tok, 'src>>| Pat {
+            kind: bump.alloc(PatKind::Wildcard),
+            span: e.span(),
+        });
 
     let pat_lit = select! {
-        Token::Int(n)   => Pat::Lit(Literal::Int(n)),
-        Token::Float(f) => Pat::Lit(Literal::Float(f)),
-        Token::True     => Pat::Lit(Literal::Bool(true)),
-        Token::False    => Pat::Lit(Literal::Bool(false)),
-    };
+        Token::Int(n)   => Literal::Int(n),
+        Token::Float(f) => Literal::Float(f),
+        Token::True     => Literal::Bool(true),
+        Token::False    => Literal::Bool(false),
+    }
+    .map_with(|lit, e: &mut MapExtra<'_, '_, I, Extra<'tok, 'src>>| Pat {
+        kind: bump.alloc(PatKind::Lit(lit)),
+        span: e.span(),
+    });
 
-    let pat_var = ident_parser().map(|name| Pat::Var(name));
+    let pat_var = ident_parser()
+        .map_with(|name, e: &mut MapExtra<'_, '_, I, Extra<'tok, 'src>>| Pat {
+            kind: bump.alloc(PatKind::Var(name)),
+            span: e.span(),
+        });
 
     wildcard.or(pat_lit).or(pat_var).boxed()
 }
@@ -237,7 +250,7 @@ where
     'bump: 'tok,
 {
     let arm = just(Token::Pipe)
-        .ignore_then(pat_parser())
+        .ignore_then(pat_parser(bump))
         .then_ignore(just(Token::StrongArrow))
         .then(expr);
 

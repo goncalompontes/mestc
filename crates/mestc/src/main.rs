@@ -181,16 +181,20 @@ fn check(src: &str) -> Result<(), ()> {
             }
             Err(())
         }
-        Ok(expr) => match typecheck::run_inference(&expr, &mut rodeo) {
-            Ok(tree) => {
-                let ty = typecheck::infer_type(&expr, &mut rodeo).map_err(|_| ())?;
-                println!("{} : {}", AstPrinter::print_expr(&expr, &rodeo), ty);
-                println!();
-                println!("{}", tree.display_tree());
+        Ok(expr) => {
+            let result = typecheck::typecheck(&expr, &mut rodeo);
+            println!("{} : {}", AstPrinter::print_expr(&expr, &rodeo), result.ty);
+            println!();
+            println!("{}", result.tree.display_tree());
+
+            if result.errors.is_empty() {
                 Ok(())
-            }
-            Err(()) => {
-                eprintln!("type inference failed");
+            } else {
+                for err in &result.errors {
+                    err.to_report()
+                        .eprint(ariadne::Source::from(src))
+                        .unwrap();
+                }
                 Err(())
             }
         },

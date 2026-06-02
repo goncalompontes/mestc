@@ -14,3 +14,4 @@ lasso = "0.7.3"
 logos = { version = "0.16.1", features = ["default"] }
 tokio = { version = "1", features = ["full"] }
 itertools = { version = "0.14.0", features = ["default"] }
+thiserror = "2"

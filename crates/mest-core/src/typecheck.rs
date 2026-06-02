@@ -1,11 +1,14 @@
 use std::collections::{BTreeMap, HashMap};
+use std::ops::Range;
 
+use chumsky::span::SimpleSpan;
 use im::HashSet;
 use itertools::Itertools;
 use lasso::Rodeo;
+use thiserror::Error;
 
 use crate::{
-    ast::{BinOp, Expr, ExprKind, Ident, Literal, Pat, UnaryOp},
+    ast::{BinOp, Expr, ExprKind, Ident, Literal, Pat, PatKind, UnaryOp},
     hir::{Type, TypeVar},
 };
 
@@ -24,6 +27,92 @@ impl std::fmt::Display for Scheme {
             write!(f, "forall {}. {}", self.type_vars.iter().join(" "), self.ty)
         }
     }
+}
+
+#[derive(Error, Debug)]
+pub enum InferenceError {
+    #[error("Variable '{name}' not found in environment")]
+    UnboundVariable { span: SimpleSpan, name: String },
+
+    #[error("Type mismatch")]
+    UnificationFailure {
+        span: SimpleSpan,
+        expected: Type,
+        actual: Type,
+    },
+
+    #[error("Occurs check failed: infinite type")]
+    OccursCheck {
+        span: SimpleSpan,
+        var: TypeVar,
+        ty: Type,
+    },
+
+    #[error("Tuple length mismatch")]
+    TupleLengthMismatch {
+        span: SimpleSpan,
+        left_len: usize,
+        right_len: usize,
+    },
+
+    #[error("Match expression has no arms")]
+    NoMatchArms { span: SimpleSpan },
+}
+
+impl InferenceError {
+    fn span(&self) -> SimpleSpan {
+        match self {
+            Self::UnboundVariable { span, .. } => *span,
+            Self::UnificationFailure { span, .. } => *span,
+            Self::OccursCheck { span, .. } => *span,
+            Self::TupleLengthMismatch { span, .. } => *span,
+            Self::NoMatchArms { span } => *span,
+        }
+    }
+
+    fn label(&self) -> String {
+        match self {
+            Self::UnboundVariable { name, .. } => {
+                format!("`{name}` is not defined in this scope")
+            }
+            Self::UnificationFailure {
+                expected, actual, ..
+            } => {
+                format!("expected `{expected}`, found `{actual}`")
+            }
+            Self::OccursCheck { var, ty, .. } => {
+                format!("type variable `{var}` occurs in `{ty}`")
+            }
+            Self::TupleLengthMismatch {
+                left_len,
+                right_len,
+                ..
+            } => {
+                format!("expected {left_len} elements, found {right_len}")
+            }
+            Self::NoMatchArms { .. } => "add at least one arm to this match expression".into(),
+        }
+    }
+
+    pub fn to_report(&self) -> ariadne::Report<'_, ((), Range<usize>)> {
+        let span = self.span().into_range();
+        ariadne::Report::build(ariadne::ReportKind::Error, ((), span.clone()))
+            .with_config(ariadne::Config::new().with_index_type(ariadne::IndexType::Byte))
+            .with_code(4)
+            .with_message(self.to_string())
+            .with_label(
+                ariadne::Label::new(((), span))
+                    .with_message(self.label())
+                    .with_color(ariadne::Color::Red),
+            )
+            .finish()
+    }
+}
+
+pub struct TypeCheckResult {
+    pub ty: Type,
+    pub errors: Vec<InferenceError>,
+    pub tree: InferenceTree,
 }
 
 pub type TyVar = TypeVar;
@@ -131,6 +220,7 @@ impl InferenceTree {
 pub struct TypeInference<'rodeo> {
     counter: u64,
     rodeo: &'rodeo mut Rodeo,
+    errors: Vec<InferenceError>,
 }
 
 impl<'rodeo> TypeInference<'rodeo> {
@@ -139,6 +229,14 @@ impl<'rodeo> TypeInference<'rodeo> {
         let var = self.counter;
         self.counter += 1;
         TypeVar(var)
+    }
+
+    fn emit_error(&mut self, err: InferenceError) {
+        self.errors.push(err);
+    }
+
+    pub fn take_errors(&mut self) -> Vec<InferenceError> {
+        std::mem::take(&mut self.errors)
     }
 
     fn instantiate(&mut self, scheme: &Scheme) -> Type {
@@ -182,6 +280,7 @@ impl<'rodeo> TypeInference<'rodeo> {
                 Type::Tuple(types.iter().map(|ty| Self::apply_type(s, ty)).collect())
             }
             Type::Int | Type::Bool | Type::Float => ty.clone(),
+            Type::Error | Type::Never => ty.clone(),
         }
     }
 
@@ -205,50 +304,69 @@ impl<'rodeo> TypeInference<'rodeo> {
             .collect()
     }
 
-    fn unify(&self, this: &Type, other: &Type) -> Result<(Subst, InferenceTree), ()> {
+    fn unify(&mut self, this: &Type, other: &Type, span: SimpleSpan) -> (Subst, InferenceTree) {
         let input = format!("{} ~ {}", this, other);
 
+        let error = |_this: &Type, _other: &Type, msg: &str| {
+            let tree = InferenceTree::new("T-Error", &input, msg, vec![]);
+            (Subst::empty(), tree)
+        };
+
         match (this, other) {
+            (Type::Error, _) | (_, Type::Error) | (Type::Never, _) | (_, Type::Never) => {
+                let tree = InferenceTree::new("Unify-Base", &input, "{}", vec![]);
+                (Subst::empty(), tree)
+            }
             // if types are the same we have no substitutions to make
             (Type::Int, Type::Int) | (Type::Float, Type::Float) | (Type::Bool, Type::Bool) => {
                 let tree = InferenceTree::new("Unify-Base", &input, "{}", vec![]);
-                Ok((Subst::empty(), tree))
+                (Subst::empty(), tree)
             }
             (Type::Var(var), ty) | (ty, Type::Var(var)) => {
                 if ty == &Type::Var(var.clone()) {
                     // if both are the same type variable then we have no substitutions
                     let tree = InferenceTree::new("Unify-Var-Same", &input, "{}", vec![]);
-                    Ok((Subst::empty(), tree))
+                    (Subst::empty(), tree)
                 } else if self.occurs_check(var, ty) {
-                    // if the type variable occurs in the type then that's an error (recursive type definition)
-                    Err(()) // replace with better errors
+                    self.emit_error(InferenceError::OccursCheck {
+                        span,
+                        var: var.clone(),
+                        ty: ty.clone(),
+                    });
+                    error(this, other, "occurs check failed")
                 } else {
                     // we have a typevar and type so we can assign the type to that type variable
                     let subst = Subst::singleton_type(var.clone(), ty.clone());
                     let output = format!("{{{}/{}}}", ty, var);
                     let tree = InferenceTree::new("Unfiy-Var", &input, &output, vec![]);
-                    Ok((subst, tree))
+                    (subst, tree)
                 }
             }
             (Type::Arrow(from_a, to_a), Type::Arrow(from_b, to_b)) => {
                 // first we unify both `from` types
-                let (from, from_tree) = self.unify(from_a, from_b)?;
+                let (from, from_tree) = self.unify(from_a, from_b, span);
                 // then we unify both the `to` types after applying the substitutions that resulted from unifying from
                 let (to, to_tree) = self.unify(
                     &Self::apply_type(&from, to_a),
                     &Self::apply_type(&from, to_b),
-                )?;
+                    span,
+                );
                 // then we just compose the substitutions together
                 let final_subst = to.compose(&from);
                 let output = self.pretty_subst(&final_subst);
                 let tree =
                     InferenceTree::new("Unify-Arrow", &input, &output, vec![from_tree, to_tree]);
-                Ok((final_subst, tree))
+                (final_subst, tree)
             }
             (Type::Tuple(ts1), Type::Tuple(ts2)) => {
                 // if their length doesn't match then we can exit early since know the types cannot possibly match
                 if ts1.len() != ts2.len() {
-                    return Err(()); // change to better types
+                    self.emit_error(InferenceError::TupleLengthMismatch {
+                        span,
+                        left_len: ts1.len(),
+                        right_len: ts2.len(),
+                    });
+                    return error(this, other, "tuple length mismatch");
                 };
 
                 let mut subst = Subst::empty();
@@ -256,21 +374,31 @@ impl<'rodeo> TypeInference<'rodeo> {
 
                 // for each pair of types in the tuple types, try unifying them, after applying the substitutions that resulted from previous unifications
                 for (t1, t2) in ts1.iter().zip(ts2.iter()) {
-                    let (s, tree) =
-                        self.unify(&Self::apply_type(&subst, t1), &Self::apply_type(&subst, t2))?;
+                    let (s, tree) = self.unify(
+                        &Self::apply_type(&subst, t1),
+                        &Self::apply_type(&subst, t2),
+                        span,
+                    );
                     subst = s.compose(&subst);
                     trees.push(tree);
                 }
 
                 let output = self.pretty_subst(&subst);
                 let tree = InferenceTree::new("Unify-Tuple", &input, &output, trees);
-                Ok((subst, tree))
+                (subst, tree)
             }
-            _ => Err(()), // change to better types
+            _ => {
+                self.emit_error(InferenceError::UnificationFailure {
+                    span,
+                    expected: this.clone(),
+                    actual: other.clone(),
+                });
+                error(this, other, "type mismatch")
+            }
         }
     }
 
-    pub fn infer(&mut self, env: &Env, expr: &Expr) -> Result<(Subst, Type, InferenceTree), ()> {
+    pub fn infer(&mut self, env: &Env, expr: &Expr) -> (Subst, Type, InferenceTree) {
         match &**expr {
             ExprKind::Literal(literal) => self.infer_lit(env, expr, literal),
             ExprKind::Var(ident) => self.infer_var(env, expr, *ident),
@@ -293,21 +421,24 @@ impl<'rodeo> TypeInference<'rodeo> {
         }
     }
 
-    fn infer_var(
-        &mut self,
-        env: &Env,
-        expr: &Expr,
-        name: Ident,
-    ) -> Result<(Subst, Type, InferenceTree), ()> {
+    fn infer_var(&mut self, env: &Env, expr: &Expr, name: Ident) -> (Subst, Type, InferenceTree) {
         let input = format!("{} ⊢ {} ⇒", self.pretty_env(env), expr.display(self.rodeo));
         match env.get(&name) {
             Some(scheme) => {
                 let instantiated = self.instantiate(scheme);
                 let output = format!("{}", instantiated);
                 let tree = InferenceTree::new("T-Var", &input, &output, vec![]);
-                Ok((Subst::empty(), instantiated, tree))
+                (Subst::empty(), instantiated, tree)
             }
-            None => Err(()), // replace with proper errors
+            None => {
+                let err = InferenceError::UnboundVariable {
+                    span: expr.span,
+                    name: self.rodeo.resolve(&name.0).to_owned(),
+                };
+                self.emit_error(err);
+                let tree = InferenceTree::new("T-Error", &input, "unbound variable", vec![]);
+                (Subst::empty(), Type::Error, tree)
+            }
         }
     }
 
@@ -317,7 +448,7 @@ impl<'rodeo> TypeInference<'rodeo> {
         expr: &Expr,
         param: &TmVar,
         body: &Expr,
-    ) -> Result<(Subst, Type, InferenceTree), ()> {
+    ) -> (Subst, Type, InferenceTree) {
         let input = format!("{} ⊢ {} ⇒", self.pretty_env(env), expr.display(self.rodeo));
 
         // create a new type variable for the param
@@ -332,7 +463,7 @@ impl<'rodeo> TypeInference<'rodeo> {
         new_env.insert(*param, param_scheme);
 
         // infer the body of the abstraction
-        let (s1, body_ty, tree1) = self.infer(&new_env, body)?;
+        let (s1, body_ty, tree1) = self.infer(&new_env, body);
         // the result type is constructed by applying the substitution that resulted from infering the body
         // to the param type and creating an arrow from it to the infered body type
         let result_ty = Type::Arrow(
@@ -342,7 +473,7 @@ impl<'rodeo> TypeInference<'rodeo> {
 
         let output = format!("{}", result_ty);
         let tree = InferenceTree::new("T-Abs", &input, &output, vec![tree1]);
-        Ok((s1, result_ty, tree))
+        (s1, result_ty, tree)
     }
 
     fn infer_app(
@@ -351,17 +482,17 @@ impl<'rodeo> TypeInference<'rodeo> {
         expr: &Expr,
         func: &Expr,
         arg: &Expr,
-    ) -> Result<(Subst, Type, InferenceTree), ()> {
+    ) -> (Subst, Type, InferenceTree) {
         let input = format!("{} ⊢ {} ⇒", self.pretty_env(env), expr.display(self.rodeo));
 
         let result_ty = Type::Var(self.fresh_tyvar());
 
         // we infer the abstraction applicative
-        let (s1, func_ty, tree1) = self.infer(env, func)?;
+        let (s1, func_ty, tree1) = self.infer(env, func);
         // then apply the resulting substitution to the env
         let env_subst = Self::apply_env(&s1, env);
         // we infer the argument applied
-        let (s2, arg_ty, tree2) = self.infer(&env_subst, arg)?;
+        let (s2, arg_ty, tree2) = self.infer(&env_subst, arg);
 
         // now that we infered the argument, we apply the substitutions from the arg in the abstraction
         // we get a type for the instantiated function type
@@ -370,7 +501,7 @@ impl<'rodeo> TypeInference<'rodeo> {
         let expected_func_ty = Type::Arrow(Box::new(arg_ty), Box::new(result_ty.clone()));
 
         // we unify the expected type for the abstraction with the infered one
-        let (s3, tree3) = self.unify(&func_ty_subst, &expected_func_ty)?;
+        let (s3, tree3) = self.unify(&func_ty_subst, &expected_func_ty, func.span);
 
         // we compose all substitutions together
         let final_subst = s3.compose(&s2.compose(&s1));
@@ -379,7 +510,7 @@ impl<'rodeo> TypeInference<'rodeo> {
 
         let output = format!("{}", final_ty);
         let tree = InferenceTree::new("T-App", &input, &output, vec![tree1, tree2, tree3]);
-        Ok((final_subst, final_ty, tree))
+        (final_subst, final_ty, tree)
     }
 
     fn infer_let(
@@ -389,11 +520,11 @@ impl<'rodeo> TypeInference<'rodeo> {
         var: &TmVar,
         value: &Expr,
         body: &Expr,
-    ) -> Result<(Subst, Type, InferenceTree), ()> {
+    ) -> (Subst, Type, InferenceTree) {
         let input = format!("{} ⊢ {} ⇒", self.pretty_env(env), expr.display(self.rodeo));
 
         // we infer the value of the let binding
-        let (s1, value_ty, tree1) = self.infer(env, value)?;
+        let (s1, value_ty, tree1) = self.infer(env, value);
         // then we apply the substitution from the infered value to the env
         let env_subst = Self::apply_env(&s1, env);
         // and generalize the type of the value with the context of the env
@@ -404,13 +535,13 @@ impl<'rodeo> TypeInference<'rodeo> {
         new_env.insert(var.clone(), generalized_ty);
 
         // we infer the body of the let binding (the expression the let binding is bound in)
-        let (s2, body_ty, tree2) = self.infer(&new_env, body)?;
+        let (s2, body_ty, tree2) = self.infer(&new_env, body);
 
         // then finally we compose the substitutions
         let final_subst = s2.compose(&s1);
         let output = format!("{}", body_ty);
         let tree = InferenceTree::new("T-Let", &input, &output, vec![tree1, tree2]);
-        Ok((final_subst, body_ty, tree))
+        (final_subst, body_ty, tree)
     }
 
     fn infer_if(
@@ -420,21 +551,21 @@ impl<'rodeo> TypeInference<'rodeo> {
         cond: &Expr,
         then_expr: &Expr,
         else_expr: &Expr,
-    ) -> Result<(Subst, Type, InferenceTree), ()> {
+    ) -> (Subst, Type, InferenceTree) {
         let input = format!("{} ⊢ {} ⇒", self.pretty_env(env), expr.display(self.rodeo));
 
-        let (s1, cond_ty, tree1) = self.infer(env, cond)?;
+        let (s1, cond_ty, tree1) = self.infer(env, cond);
         let env1 = Self::apply_env(&s1, env);
-        let (s2, then_ty, tree2) = self.infer(&env1, then_expr)?;
+        let (s2, then_ty, tree2) = self.infer(&env1, then_expr);
         let env2 = Self::apply_env(&s2, &env1);
-        let (s3, else_ty, tree3) = self.infer(&env2, else_expr)?;
+        let (s3, else_ty, tree3) = self.infer(&env2, else_expr);
 
         let cond_ty_s = Self::apply_type(&s3, &Self::apply_type(&s2, &cond_ty));
-        let (s4, cond_tree) = self.unify(&cond_ty_s, &Type::Bool)?;
+        let (s4, cond_tree) = self.unify(&cond_ty_s, &Type::Bool, cond.span);
 
         let then_ty_s = Self::apply_type(&s4, &Self::apply_type(&s3, &then_ty));
         let else_ty_s = Self::apply_type(&s4, &else_ty);
-        let (s5, eq_tree) = self.unify(&then_ty_s, &else_ty_s)?;
+        let (s5, eq_tree) = self.unify(&then_ty_s, &else_ty_s, then_expr.span);
 
         let final_subst = s5.compose(&s4.compose(&s3.compose(&s2.compose(&s1))));
         let final_ty = Self::apply_type(&final_subst, &then_ty);
@@ -446,7 +577,7 @@ impl<'rodeo> TypeInference<'rodeo> {
             &output,
             vec![tree1, tree2, tree3, cond_tree, eq_tree],
         );
-        Ok((final_subst, final_ty, tree))
+        (final_subst, final_ty, tree)
     }
 
     fn infer_binop(
@@ -456,7 +587,7 @@ impl<'rodeo> TypeInference<'rodeo> {
         op: &BinOp,
         lhs: &Expr,
         rhs: &Expr,
-    ) -> Result<(Subst, Type, InferenceTree), ()> {
+    ) -> (Subst, Type, InferenceTree) {
         let input = format!("{} ⊢ {} ⇒", self.pretty_env(env), expr.display(self.rodeo));
 
         let (expected_lhs_ty, expected_rhs_ty, result_ty) = match op {
@@ -469,15 +600,15 @@ impl<'rodeo> TypeInference<'rodeo> {
             BinOp::And | BinOp::Or => (Type::Bool, Type::Bool, Type::Bool),
         };
 
-        let (s1, lhs_ty, tree1) = self.infer(env, lhs)?;
+        let (s1, lhs_ty, tree1) = self.infer(env, lhs);
         let env1 = Self::apply_env(&s1, env);
-        let (s2, rhs_ty, tree2) = self.infer(&env1, rhs)?;
+        let (s2, rhs_ty, tree2) = self.infer(&env1, rhs);
 
         let lhs_ty_s = Self::apply_type(&s2, &lhs_ty);
-        let (s3, lhs_tree) = self.unify(&lhs_ty_s, &expected_lhs_ty)?;
+        let (s3, lhs_tree) = self.unify(&lhs_ty_s, &expected_lhs_ty, lhs.span);
 
         let rhs_ty_s = Self::apply_type(&s3, &rhs_ty);
-        let (s4, rhs_tree) = self.unify(&rhs_ty_s, &expected_rhs_ty)?;
+        let (s4, rhs_tree) = self.unify(&rhs_ty_s, &expected_rhs_ty, rhs.span);
 
         let final_subst = s4.compose(&s3.compose(&s2.compose(&s1)));
         let final_ty = Self::apply_type(&final_subst, &result_ty);
@@ -489,7 +620,7 @@ impl<'rodeo> TypeInference<'rodeo> {
             &output,
             vec![tree1, tree2, lhs_tree, rhs_tree],
         );
-        Ok((final_subst, final_ty, tree))
+        (final_subst, final_ty, tree)
     }
 
     fn infer_unaryop(
@@ -498,7 +629,7 @@ impl<'rodeo> TypeInference<'rodeo> {
         expr: &Expr,
         op: &UnaryOp,
         rhs: &Expr,
-    ) -> Result<(Subst, Type, InferenceTree), ()> {
+    ) -> (Subst, Type, InferenceTree) {
         let input = format!("{} ⊢ {} ⇒", self.pretty_env(env), expr.display(self.rodeo));
 
         let (expected_arg_ty, result_ty) = match op {
@@ -506,22 +637,22 @@ impl<'rodeo> TypeInference<'rodeo> {
             UnaryOp::Not => (Type::Bool, Type::Bool),
         };
 
-        let (s1, rhs_ty, tree1) = self.infer(env, rhs)?;
+        let (s1, rhs_ty, tree1) = self.infer(env, rhs);
         let rhs_ty_s = Self::apply_type(&s1, &rhs_ty);
-        let (s2, rhs_tree) = self.unify(&rhs_ty_s, &expected_arg_ty)?;
+        let (s2, rhs_tree) = self.unify(&rhs_ty_s, &expected_arg_ty, rhs.span);
 
         let final_subst = s2.compose(&s1);
         let final_ty = Self::apply_type(&final_subst, &result_ty);
 
         let output = format!("{}", final_ty);
         let tree = InferenceTree::new("T-UnaryOp", &input, &output, vec![tree1, rhs_tree]);
-        Ok((final_subst, final_ty, tree))
+        (final_subst, final_ty, tree)
     }
 
     fn infer_pat(&mut self, pat: &Pat) -> (Type, Vec<(Ident, Scheme)>) {
-        match pat {
-            Pat::Wildcard => (Type::Var(self.fresh_tyvar()), vec![]),
-            Pat::Var(ident) => {
+        match &**pat {
+            PatKind::Wildcard => (Type::Var(self.fresh_tyvar()), vec![]),
+            PatKind::Var(ident) => {
                 let ty = Type::Var(self.fresh_tyvar());
                 let scheme = Scheme {
                     type_vars: vec![],
@@ -529,7 +660,7 @@ impl<'rodeo> TypeInference<'rodeo> {
                 };
                 (ty, vec![(*ident, scheme)])
             }
-            Pat::Lit(lit) => {
+            PatKind::Lit(lit) => {
                 let ty = match lit {
                     Literal::Int(_) => Type::Int,
                     Literal::Float(_) => Type::Float,
@@ -537,12 +668,10 @@ impl<'rodeo> TypeInference<'rodeo> {
                 };
                 (ty, vec![])
             }
-            Pat::Or(a, b) => {
+            PatKind::Or(a, b) => {
                 let (ty_a, mut bindings) = self.infer_pat(a);
                 let (ty_b, bindings_b) = self.infer_pat(b);
-                let (s, _) = self
-                    .unify(&ty_a, &ty_b)
-                    .unwrap_or((Subst::empty(), InferenceTree::new("", "", "", vec![])));
+                let (s, _) = self.unify(&ty_a, &ty_b, pat.span);
                 let unified = Self::apply_type(&s, &ty_a);
                 bindings.extend(bindings_b.into_iter().map(|(id, scheme)| {
                     (
@@ -564,10 +693,10 @@ impl<'rodeo> TypeInference<'rodeo> {
         expr: &Expr,
         scrutinee: &Expr,
         arms: &[(Pat, Expr)],
-    ) -> Result<(Subst, Type, InferenceTree), ()> {
+    ) -> (Subst, Type, InferenceTree) {
         let input = format!("{} ⊢ {} ⇒", self.pretty_env(env), expr.display(self.rodeo));
 
-        let (s1, scrut_ty, tree1) = self.infer(env, scrutinee)?;
+        let (s1, scrut_ty, tree1) = self.infer(env, scrutinee);
         let mut final_subst = s1;
         let mut arm_trees = vec![tree1];
         let mut body_ty_opt = None;
@@ -577,7 +706,7 @@ impl<'rodeo> TypeInference<'rodeo> {
 
             let pat_ty_s = Self::apply_type(&final_subst, &pat_ty);
             let scrut_ty_s = Self::apply_type(&final_subst, &scrut_ty);
-            let (s_pat, pat_tree) = self.unify(&pat_ty_s, &scrut_ty_s)?;
+            let (s_pat, pat_tree) = self.unify(&pat_ty_s, &scrut_ty_s, scrutinee.span);
             final_subst = s_pat.compose(&final_subst);
             arm_trees.push(pat_tree);
 
@@ -590,7 +719,7 @@ impl<'rodeo> TypeInference<'rodeo> {
                 env
             };
 
-            let (s_body, this_body_ty, body_tree) = self.infer(&env_arm, body)?;
+            let (s_body, this_body_ty, body_tree) = self.infer(&env_arm, body);
             final_subst = s_body.compose(&final_subst);
             arm_trees.push(body_tree);
 
@@ -598,7 +727,7 @@ impl<'rodeo> TypeInference<'rodeo> {
                 Some(ref prev_ty) => {
                     let prev_ty_s = Self::apply_type(&final_subst, prev_ty);
                     let this_ty_s = Self::apply_type(&final_subst, &this_body_ty);
-                    let (s_uni, uni_tree) = self.unify(&prev_ty_s, &this_ty_s)?;
+                    let (s_uni, uni_tree) = self.unify(&prev_ty_s, &this_ty_s, body.span);
                     final_subst = s_uni.compose(&final_subst);
                     arm_trees.push(uni_tree);
                 }
@@ -610,12 +739,17 @@ impl<'rodeo> TypeInference<'rodeo> {
 
         let final_ty = match body_ty_opt {
             Some(ty) => Self::apply_type(&final_subst, &ty),
-            None => return Err(()),
+            None => {
+                self.emit_error(InferenceError::NoMatchArms { span: expr.span });
+                let output = format!("{}", Type::Never);
+                let tree = InferenceTree::new("T-Match", &input, &output, arm_trees);
+                return (final_subst, Type::Never, tree);
+            }
         };
 
         let output = format!("{}", final_ty);
         let tree = InferenceTree::new("T-Match", &input, &output, arm_trees);
-        Ok((final_subst, final_ty, tree))
+        (final_subst, final_ty, tree)
     }
 
     fn infer_lit(
@@ -623,7 +757,7 @@ impl<'rodeo> TypeInference<'rodeo> {
         env: &Env,
         expr: &Expr,
         literal: &Literal,
-    ) -> Result<(Subst, Type, InferenceTree), ()> {
+    ) -> (Subst, Type, InferenceTree) {
         let input = format!("{} ⊢ {} ⇒", self.pretty_env(env), expr.display(self.rodeo));
         let (rule, output, ty) = match literal {
             Literal::Int(_) => ("T-Int", "Int", Type::Int),
@@ -631,7 +765,7 @@ impl<'rodeo> TypeInference<'rodeo> {
             Literal::Bool(_) => ("T-Bool", "Bool", Type::Bool),
         };
         let tree = InferenceTree::new(rule, input, output, vec![]);
-        Ok((Subst::empty(), ty, tree))
+        (Subst::empty(), ty, tree)
     }
 
     fn pretty_subst(&self, subst: &Subst) -> String {
@@ -668,7 +802,11 @@ impl<'rodeo> TypeInference<'rodeo> {
     }
 
     pub fn new(rodeo: &'rodeo mut Rodeo) -> Self {
-        Self { counter: 0, rodeo }
+        Self {
+            counter: 0,
+            rodeo,
+            errors: Vec::new(),
+        }
     }
 }
 
@@ -687,6 +825,7 @@ fn ftv_type(ty: &Type, out: &mut FreeVars) {
             }
         }
         Type::Int | Type::Bool | Type::Float => {}
+        Type::Error | Type::Never => {}
     }
 }
 
@@ -720,18 +859,33 @@ fn rename_scheme(s: &Scheme) -> Type {
     TypeInference::apply_type(&subst, &s.ty)
 }
 
-pub fn run_inference(expr: &Expr, rodeo: &mut Rodeo) -> Result<InferenceTree, ()> {
+pub fn typecheck(expr: &Expr, rodeo: &mut Rodeo) -> TypeCheckResult {
     let mut inference = TypeInference::new(rodeo);
-    let env = BTreeMap::new();
-    let (_, _, tree) = inference.infer(&env, expr)?;
-    Ok(tree)
+    let env = Env::new();
+    let (s, ty, tree) = inference.infer(&env, expr);
+    let final_ty = TypeInference::apply_type(&s, &ty);
+    let scheme = inference.generalize(&env, &final_ty);
+    TypeCheckResult {
+        ty: rename_scheme(&scheme),
+        errors: inference.take_errors(),
+        tree,
+    }
+}
+
+pub fn run_inference(expr: &Expr, rodeo: &mut Rodeo) -> Result<InferenceTree, ()> {
+    let result = typecheck(expr, rodeo);
+    if result.errors.is_empty() {
+        Ok(result.tree)
+    } else {
+        Err(())
+    }
 }
 
 pub fn infer_type(expr: &Expr, rodeo: &mut Rodeo) -> Result<Type, ()> {
-    let mut inference = TypeInference::new(rodeo);
-    let env = Env::new();
-    let (s, ty, _) = inference.infer(&env, expr)?;
-    let final_ty = TypeInference::apply_type(&s, &ty);
-    let scheme = inference.generalize(&env, &final_ty);
-    Ok(rename_scheme(&scheme))
+    let result = typecheck(expr, rodeo);
+    if result.errors.is_empty() {
+        Ok(result.ty)
+    } else {
+        Err(())
+    }
 }

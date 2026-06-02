@@ -17,3 +17,5 @@ im = { workspace = true }
 lasso = { workspace = true }
 logos = { workspace = true }
 itertools.workspace = true
+thiserror = { workspace = true }
+ariadne = { workspace = true }

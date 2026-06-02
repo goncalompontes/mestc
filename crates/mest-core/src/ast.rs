@@ -39,7 +39,21 @@ pub enum UnaryOp {
 }
 
 #[derive(Debug, Clone)]
-pub enum Pat<'bump> {
+pub struct Pat<'bump> {
+    pub kind: &'bump PatKind<'bump>,
+    pub span: SimpleSpan,
+}
+
+impl<'bump> Deref for Pat<'bump> {
+    type Target = PatKind<'bump>;
+
+    fn deref(&self) -> &Self::Target {
+        self.kind
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum PatKind<'bump> {
     Wildcard,
     Var(Ident),
     Lit(Literal),
@@ -381,13 +395,13 @@ impl<'bump> ExprKind<'bump> {
         env: &mut Env<'bump>,
         rodeo: &Rodeo,
     ) -> Result<bool, EvalError> {
-        match pat {
-            Pat::Wildcard => Ok(true),
-            Pat::Var(name) => {
+        match &**pat {
+            PatKind::Wildcard => Ok(true),
+            PatKind::Var(name) => {
                 env.insert(*name, thunk.clone());
                 Ok(true)
             }
-            Pat::Lit(lit) => {
+            PatKind::Lit(lit) => {
                 let val = thunk.force(rodeo)?;
                 Ok(match (lit, &val) {
                     (Literal::Int(a), Value::Int(b)) => a == b,
@@ -396,7 +410,7 @@ impl<'bump> ExprKind<'bump> {
                     _ => false,
                 })
             }
-            Pat::Or(a, b) => {
+            PatKind::Or(a, b) => {
                 let mut env_a = env.clone();
                 if Self::match_pat(a, thunk, &mut env_a, rodeo)? {
                     *env = env_a;
