@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 #[derive(Clone, Debug)]
 pub struct Thunk<'bump> {
-    expr: &'bump ExprKind<'bump>,
+    expr: Option<&'bump ExprKind<'bump>>,
     env: Rc<RefCell<Env<'bump>>>,
     value: Rc<RefCell<Option<Value<'bump>>>>,
 }
@@ -13,7 +13,7 @@ pub struct Thunk<'bump> {
 impl<'bump> Thunk<'bump> {
     pub fn new(expr: &'bump ExprKind<'bump>, env: Env<'bump>) -> Self {
         Self {
-            expr,
+            expr: Some(expr),
             env: Rc::new(RefCell::new(env)),
             value: Rc::new(RefCell::new(None)),
         }
@@ -21,9 +21,17 @@ impl<'bump> Thunk<'bump> {
 
     pub fn new_shared(expr: &'bump ExprKind<'bump>, env: Rc<RefCell<Env<'bump>>>) -> Self {
         Self {
-            expr,
+            expr: Some(expr),
             env,
             value: Rc::new(RefCell::new(None)),
+        }
+    }
+
+    pub fn from_value(value: Value<'bump>, env: Env<'bump>) -> Self {
+        Self {
+            expr: None,
+            env: Rc::new(RefCell::new(env)),
+            value: Rc::new(RefCell::new(Some(value))),
         }
     }
 
@@ -36,7 +44,7 @@ impl<'bump> Thunk<'bump> {
             return Ok(val.clone());
         }
         let env = self.env.borrow().clone();
-        let val = self.expr.eval_lazy(&env, rodeo)?;
+        let val = self.expr.unwrap().eval_lazy(&env, rodeo)?;
         *self.value.borrow_mut() = Some(val.clone());
         Ok(val)
     }

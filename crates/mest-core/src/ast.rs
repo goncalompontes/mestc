@@ -67,7 +67,7 @@ pub enum UnaryOp {
     Not,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct Pat<'bump> {
     pub kind: &'bump PatKind<'bump>,
     pub span: SimpleSpan,
@@ -87,6 +87,7 @@ pub enum PatKind<'bump> {
     Var(Ident),
     Lit(Literal),
     Or(&'bump Pat<'bump>, &'bump Pat<'bump>),
+    Tuple(&'bump [Pat<'bump>]),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -122,8 +123,7 @@ pub enum ExprKind<'bump> {
         rhs: Expr<'bump>,
     },
     Let {
-        name: Ident,
-        value: Expr<'bump>,
+        bindings: &'bump [(Ident, Expr<'bump>)],
         body: Expr<'bump>,
         rec: bool,
     },
@@ -132,13 +132,14 @@ pub enum ExprKind<'bump> {
         arms: &'bump [(Pat<'bump>, Expr<'bump>)],
     },
     Abs {
-        param: Ident,
+        param: Pat<'bump>,
         body: Expr<'bump>,
     },
     App {
         func: Expr<'bump>,
         arg: Expr<'bump>,
     },
+    Tuple(&'bump [Expr<'bump>]),
 }
 
 pub type Env<'bump> = im::HashMap<Ident, Thunk<'bump>>;
@@ -149,10 +150,11 @@ pub enum Value<'bump> {
     Float(f64),
     Bool(bool),
     Closure {
-        param: Ident,
+        param: Pat<'bump>,
         body: Expr<'bump>,
         env: Env<'bump>,
     },
+    Tuple(Vec<Value<'bump>>),
 }
 
 impl std::fmt::Display for Value<'_> {
@@ -162,6 +164,14 @@ impl std::fmt::Display for Value<'_> {
             Value::Float(n) => write!(f, "{n}"),
             Value::Bool(b) => write!(f, "{b}"),
             Value::Closure { .. } => write!(f, "<closure>"),
+            Value::Tuple(items) => {
+                write!(f, "(")?;
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "{item}")?;
+                }
+                write!(f, ")")
+            }
         }
     }
 }
@@ -198,6 +208,7 @@ fn type_name(v: &Value) -> &'static str {
         Value::Float(_) => "float",
         Value::Bool(_) => "bool",
         Value::Closure { .. } => "closure",
+        Value::Tuple(_) => "tuple",
     }
 }
 
@@ -253,15 +264,13 @@ impl<'bump> ExprKind<'bump> {
     pub fn let_expr(
         bump: &'bump Bump,
         span: SimpleSpan,
-        name: Ident,
-        value: Expr<'bump>,
+        bindings: &'bump [(Ident, Expr<'bump>)],
         body: Expr<'bump>,
         rec: bool,
     ) -> Expr<'bump> {
         Self::node(
             bump.alloc(ExprKind::Let {
-                name,
-                value,
+                bindings,
                 body,
                 rec,
             }),
@@ -281,7 +290,7 @@ impl<'bump> ExprKind<'bump> {
     pub fn lambda(
         bump: &'bump Bump,
         span: SimpleSpan,
-        param: Ident,
+        param: Pat<'bump>,
         body: Expr<'bump>,
     ) -> Expr<'bump> {
         Self::node(bump.alloc(ExprKind::Abs { param, body }), span)
@@ -294,6 +303,14 @@ impl<'bump> ExprKind<'bump> {
         arg: Expr<'bump>,
     ) -> Expr<'bump> {
         Self::node(bump.alloc(ExprKind::App { func, arg }), span)
+    }
+
+    pub fn tuple_expr(
+        bump: &'bump Bump,
+        span: SimpleSpan,
+        items: &'bump [Expr<'bump>],
+    ) -> Expr<'bump> {
+        Self::node(bump.alloc(ExprKind::Tuple(items)), span)
     }
 }
 
@@ -347,27 +364,33 @@ impl<'bump> ExprKind<'bump> {
             }
 
             ExprKind::Let {
-                name,
-                value,
+                bindings,
                 body,
                 rec: true,
             } => {
                 let rec_env = Rc::new(RefCell::new(env.clone()));
-                let thunk = Thunk::new_shared(value.kind, Rc::clone(&rec_env));
-                rec_env.borrow_mut().insert(*name, thunk.clone());
+                let mut thunks: Vec<(Ident, Thunk<'bump>)> = Vec::new();
+                for (name, value) in bindings.iter() {
+                    let thunk = Thunk::new_shared(value.kind, Rc::clone(&rec_env));
+                    rec_env.borrow_mut().insert(*name, thunk.clone());
+                    thunks.push((*name, thunk));
+                }
                 let mut body_env = env.clone();
-                body_env.insert(*name, thunk);
+                for (name, thunk) in thunks {
+                    body_env.insert(name, thunk);
+                }
                 body.kind.eval_lazy(&body_env, rodeo)
             }
 
             ExprKind::Let {
-                name,
-                value,
+                bindings,
                 body,
                 rec: false,
             } => {
                 let mut env = env.clone();
-                env.insert(*name, Self::thunk(value.kind, &env));
+                for (name, value) in bindings.iter() {
+                    env.insert(*name, Self::thunk(value.kind, &env));
+                }
                 body.kind.eval_lazy(&env, rodeo)
             }
 
@@ -409,11 +432,20 @@ impl<'bump> ExprKind<'bump> {
                         body,
                         env: mut closure_env,
                     } => {
-                        closure_env.insert(param, Self::thunk(arg.kind, env));
+                        let arg_thunk = Thunk::new(arg.kind, env.clone());
+                        Self::match_pat(&param, &arg_thunk, &mut closure_env, rodeo)?;
                         body.kind.eval_lazy(&closure_env, rodeo)
                     }
                     _ => Err(EvalError::NotAFunction),
                 }
+            }
+
+            ExprKind::Tuple(items) => {
+                let mut values = Vec::new();
+                for item in items.iter() {
+                    values.push(item.kind.eval_lazy(env, rodeo)?);
+                }
+                Ok(Value::Tuple(values))
             }
         }
     }
@@ -446,6 +478,26 @@ impl<'bump> ExprKind<'bump> {
                     Ok(true)
                 } else {
                     Self::match_pat(b, thunk, env, rodeo)
+                }
+            }
+            PatKind::Tuple(pats) => {
+                let val = thunk.force(rodeo)?;
+                match val {
+                    Value::Tuple(items) => {
+                        if pats.len() != items.len() {
+                            return Ok(false);
+                        }
+                        let mut temp_env = env.clone();
+                        for (pat, item_val) in pats.iter().zip(items.iter()) {
+                            let item_thunk = Thunk::from_value(item_val.clone(), temp_env.clone());
+                            if !Self::match_pat(pat, &item_thunk, &mut temp_env, rodeo)? {
+                                return Ok(false);
+                            }
+                        }
+                        *env = temp_env;
+                        Ok(true)
+                    }
+                    _ => Ok(false),
                 }
             }
         }

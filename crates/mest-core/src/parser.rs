@@ -81,30 +81,60 @@ where
     'src: 'tok,
     'bump: 'tok,
 {
-    let wildcard = just(Token::Ident("_"))
-        .map_with(|_, e: &mut MapExtra<'_, '_, I, Extra<'tok, 'src>>| Pat {
-            kind: bump.alloc(PatKind::Wildcard),
+    recursive(|pat| {
+        let pat = pat.boxed();
+
+        let wildcard = just(Token::Ident("_"))
+            .map_with(|_, e: &mut MapExtra<'_, '_, I, Extra<'tok, 'src>>| Pat {
+                kind: bump.alloc(PatKind::Wildcard),
+                span: e.span(),
+            });
+
+        let pat_lit = select! {
+            Token::Int(n)   => Literal::Int(n),
+            Token::Float(f) => Literal::Float(f),
+            Token::True     => Literal::Bool(true),
+            Token::False    => Literal::Bool(false),
+        }
+        .map_with(|lit, e: &mut MapExtra<'_, '_, I, Extra<'tok, 'src>>| Pat {
+            kind: bump.alloc(PatKind::Lit(lit)),
             span: e.span(),
         });
 
-    let pat_lit = select! {
-        Token::Int(n)   => Literal::Int(n),
-        Token::Float(f) => Literal::Float(f),
-        Token::True     => Literal::Bool(true),
-        Token::False    => Literal::Bool(false),
-    }
-    .map_with(|lit, e: &mut MapExtra<'_, '_, I, Extra<'tok, 'src>>| Pat {
-        kind: bump.alloc(PatKind::Lit(lit)),
-        span: e.span(),
-    });
+        let pat_var = ident_parser()
+            .map_with(|name, e: &mut MapExtra<'_, '_, I, Extra<'tok, 'src>>| Pat {
+                kind: bump.alloc(PatKind::Var(name)),
+                span: e.span(),
+            });
 
-    let pat_var = ident_parser()
-        .map_with(|name, e: &mut MapExtra<'_, '_, I, Extra<'tok, 'src>>| Pat {
-            kind: bump.alloc(PatKind::Var(name)),
-            span: e.span(),
-        });
+        let tuple_pat = just(Token::LParen)
+            .ignore_then(
+                pat.clone()
+                    .then_ignore(just(Token::Comma))
+                    .then_ignore(just(Token::RParen))
+                    .map(|p| {
+                        vec![p]
+                    })
+                    .or(
+                        pat.clone()
+                            .separated_by(just(Token::Comma))
+                            .at_least(2)
+                            .collect::<Vec<_>>()
+                            .then_ignore(just(Token::RParen)),
+                    ),
+            )
+            .map_with(|pats, e| Pat {
+                kind: bump.alloc(PatKind::Tuple(bump.alloc_slice_fill_iter(pats))),
+                span: e.span(),
+            });
 
-    wildcard.or(pat_lit).or(pat_var).boxed()
+        wildcard
+            .or(pat_lit)
+            .or(pat_var)
+            .or(tuple_pat)
+            .boxed()
+    })
+    .boxed()
 }
 
 fn atom_parser<'tok, 'src, 'bump, I>(
@@ -116,11 +146,31 @@ where
     'src: 'tok,
     'bump: 'tok,
 {
-    let group = expr.delimited_by(just(Token::LParen), just(Token::RParen));
+    let tuple_or_group = just(Token::LParen)
+        .ignore_then(expr.clone())
+        .then(
+            just(Token::Comma)
+                .ignore_then(
+                    expr.clone()
+                        .separated_by(just(Token::Comma))
+                        .collect::<Vec<_>>(),
+                )
+                .then_ignore(just(Token::RParen))
+                .or(just(Token::RParen).map(|_| vec![])),
+        )
+        .map_with(|(first, rest), e| {
+            if rest.is_empty() {
+                first
+            } else {
+                let mut items = vec![first];
+                items.extend(rest);
+                ExprKind::tuple_expr(bump, e.span(), bump.alloc_slice_fill_iter(items))
+            }
+        });
 
     literal_parser(bump)
         .or(ident_expr_parser(bump))
-        .or(group)
+        .or(tuple_or_group)
         .boxed()
 }
 
@@ -276,19 +326,28 @@ where
     'src: 'tok,
     'bump: 'tok,
 {
-    just(Token::Let)
-        .then(just(Token::Rec).or_not())
-        .then(ident_parser())
+    let single_binding = ident_parser()
         .then(ident_parser().repeated().collect::<Vec<_>>())
         .then_ignore(just(Token::Eq))
         .then(expr.clone())
+        .map_with(|((name, params), value), _| {
+            let value = params.into_iter().rev().fold(value, |body, param| {
+                let param_pat = Pat { kind: bump.alloc(PatKind::Var(param)), span: param.span };
+                ExprKind::lambda(bump, param_pat.span, param_pat, body)
+            });
+            (name, value)
+        });
+
+    just(Token::Let)
+        .then(just(Token::Rec).or_not())
+        .then(single_binding.clone())
+        .then(just(Token::And).ignore_then(single_binding).repeated().collect::<Vec<_>>())
         .then_ignore(just(Token::In))
         .then(expr)
-        .map_with(|(((((_, rec), name), params), value), body), e| {
-            let value = params.into_iter().rev().fold(value, |body, param| {
-                ExprKind::lambda(bump, e.span(), param, body)
-            });
-            ExprKind::let_expr(bump, e.span(), name, value, body, rec.is_some())
+        .map_with(|((((_, rec), first_binding), extra_bindings), body), e| {
+            let mut all_bindings = vec![first_binding];
+            all_bindings.extend(extra_bindings);
+            ExprKind::let_expr(bump, e.span(), bump.alloc_slice_fill_iter(all_bindings), body, rec.is_some())
         })
         .boxed()
 }
@@ -303,7 +362,7 @@ where
     'bump: 'tok,
 {
     just(Token::Pipe)
-        .ignore_then(ident_parser())
+        .ignore_then(pat_parser(bump))
         .then_ignore(just(Token::Pipe))
         .then(expr)
         .map_with(|(param, body), e| ExprKind::lambda(bump, e.span(), param, body))
