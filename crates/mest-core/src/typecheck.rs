@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
 
 use chumsky::span::SimpleSpan;
@@ -112,6 +112,84 @@ impl InferenceError {
 pub type TyVar = TypeVar;
 pub type TmVar = Ident;
 pub type Env = BTreeMap<TmVar, Scheme>;
+
+fn pat_vars(pat: &Pat) -> BTreeSet<Ident> {
+    match &**pat {
+        PatKind::Var(ident) => {
+            let mut s = BTreeSet::new();
+            s.insert(*ident);
+            s
+        }
+        PatKind::Wildcard | PatKind::Lit(_) => BTreeSet::new(),
+        PatKind::Or(a, b) => {
+            let s1 = pat_vars(a);
+            let s2 = pat_vars(b);
+            s1.union(&s2).cloned().collect()
+        }
+    }
+}
+
+fn free_vars(expr: &Expr) -> BTreeSet<Ident> {
+    match &**expr {
+        ExprKind::Literal(_) => BTreeSet::new(),
+        ExprKind::Var(ident) => {
+            let mut s = BTreeSet::new();
+            s.insert(*ident);
+            s
+        }
+        ExprKind::If {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            let s1 = free_vars(cond);
+            let s2 = free_vars(then_expr);
+            let s3 = free_vars(else_expr);
+            s1.union(&s2)
+                .cloned()
+                .collect::<BTreeSet<_>>()
+                .union(&s3)
+                .cloned()
+                .collect()
+        }
+        ExprKind::BinOp { lhs, rhs, .. } => {
+            let s1 = free_vars(lhs);
+            let s2 = free_vars(rhs);
+            s1.union(&s2).cloned().collect()
+        }
+        ExprKind::UnaryOp { rhs, .. } => free_vars(rhs),
+        ExprKind::Let {
+            name, value, body, ..
+        } => {
+            let fv_value = free_vars(value);
+            let mut fv_body = free_vars(body);
+            fv_body.remove(name);
+            fv_value.union(&fv_body).cloned().collect()
+        }
+        ExprKind::Abs { param, body } => {
+            let mut fv = free_vars(body);
+            fv.remove(param);
+            fv
+        }
+        ExprKind::App { func, arg } => {
+            let s1 = free_vars(func);
+            let s2 = free_vars(arg);
+            s1.union(&s2).cloned().collect()
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            let mut fv = free_vars(scrutinee);
+            for (pat, body) in *arms {
+                let pat_fv = pat_vars(pat);
+                let mut body_fv = free_vars(body);
+                for v in &pat_fv {
+                    body_fv.remove(v);
+                }
+                fv = fv.union(&body_fv).cloned().collect();
+            }
+            fv
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RuleName {
@@ -613,7 +691,7 @@ impl<'rodeo> TypeInference<'rodeo> {
         expr: &'a Expr<'a>,
         name: Ident,
     ) -> (Subst, Type, InferenceTree<'a>) {
-        let env_str = self.pretty_env(env);
+        let env_str = self.pretty_env(env, expr);
         match env.get(&name) {
             Some(scheme) => {
                 let instantiated = self.instantiate(scheme);
@@ -649,7 +727,7 @@ impl<'rodeo> TypeInference<'rodeo> {
         param: &TmVar,
         body: &'a Expr<'a>,
     ) -> (Subst, Type, InferenceTree<'a>) {
-        let env_str = self.pretty_env(env);
+        let env_str = self.pretty_env(env, expr);
 
         let param_ty = Type::Var(self.fresh_tyvar());
         let mut new_env = env.clone();
@@ -681,7 +759,7 @@ impl<'rodeo> TypeInference<'rodeo> {
         func: &'a Expr<'a>,
         arg: &'a Expr<'a>,
     ) -> (Subst, Type, InferenceTree<'a>) {
-        let env_str = self.pretty_env(env);
+        let env_str = self.pretty_env(env, expr);
 
         let result_ty = Type::Var(self.fresh_tyvar());
 
@@ -714,7 +792,7 @@ impl<'rodeo> TypeInference<'rodeo> {
         value: &'a Expr<'a>,
         body: &'a Expr<'a>,
     ) -> (Subst, Type, InferenceTree<'a>) {
-        let env_str = self.pretty_env(env);
+        let env_str = self.pretty_env(env, expr);
 
         let (s1, value_ty, tree1) = self.infer(env, value);
         let env_subst = Self::apply_env(&s1, env);
@@ -743,7 +821,7 @@ impl<'rodeo> TypeInference<'rodeo> {
         then_expr: &'a Expr<'a>,
         else_expr: &'a Expr<'a>,
     ) -> (Subst, Type, InferenceTree<'a>) {
-        let env_str = self.pretty_env(env);
+        let env_str = self.pretty_env(env, expr);
 
         let (s1, cond_ty, tree1) = self.infer(env, cond);
         let env1 = Self::apply_env(&s1, env);
@@ -778,7 +856,7 @@ impl<'rodeo> TypeInference<'rodeo> {
         lhs: &'a Expr<'a>,
         rhs: &'a Expr<'a>,
     ) -> (Subst, Type, InferenceTree<'a>) {
-        let env_str = self.pretty_env(env);
+        let env_str = self.pretty_env(env, expr);
 
         let (expected_lhs_ty, expected_rhs_ty, result_ty) = match op {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Pow => {
@@ -819,7 +897,7 @@ impl<'rodeo> TypeInference<'rodeo> {
         op: &UnaryOp,
         rhs: &'a Expr<'a>,
     ) -> (Subst, Type, InferenceTree<'a>) {
-        let env_str = self.pretty_env(env);
+        let env_str = self.pretty_env(env, expr);
 
         let (expected_arg_ty, result_ty) = match op {
             UnaryOp::Neg => (Type::Int, Type::Int),
@@ -924,7 +1002,7 @@ impl<'rodeo> TypeInference<'rodeo> {
         scrutinee: &'a Expr<'a>,
         arms: &'a [(Pat<'a>, Expr<'a>)],
     ) -> (Subst, Type, InferenceTree<'a>) {
-        let env_str = self.pretty_env(env);
+        let env_str = self.pretty_env(env, expr);
 
         let (s1, scrut_ty, tree1) = self.infer(env, scrutinee);
         let mut final_subst = s1;
@@ -997,7 +1075,7 @@ impl<'rodeo> TypeInference<'rodeo> {
         expr: &'a Expr<'a>,
         literal: &Literal,
     ) -> (Subst, Type, InferenceTree<'a>) {
-        let env_str = self.pretty_env(env);
+        let env_str = self.pretty_env(env, expr);
         let (rule, ty) = match literal {
             Literal::Int(_) => (RuleName::TInt, Type::Int),
             Literal::Float(_) => (RuleName::TFloat, Type::Float),
@@ -1026,14 +1104,24 @@ impl<'rodeo> TypeInference<'rodeo> {
         }
     }
 
-    fn pretty_env(&self, env: &Env) -> String {
-        if env.is_empty() {
+    fn pretty_env(&self, env: &Env, expr: &Expr) -> String {
+        let fv = free_vars(expr);
+        let relevant: Vec<_> = env
+            .iter()
+            .filter(|(k, _)| fv.contains(k))
+            .map(|(k, v)| (self.rodeo.resolve(&k.0).to_owned(), v))
+            .sorted_by(|(a, _), (b, _)| a.cmp(b))
+            .collect();
+        if relevant.is_empty() {
             "{}".to_string()
         } else {
             format!(
                 "{{{}}}",
-                env.iter()
-                    .format_with(", ", |(k, v), f| f(&format_args!("{:?}: {}", k, v)))
+                relevant
+                    .iter()
+                    .format_with(", ", |(name, scheme), f| f(&format_args!(
+                        "{name}: {scheme}"
+                    )))
             )
         }
     }

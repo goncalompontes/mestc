@@ -9,7 +9,7 @@ pub struct LexError {
     pub message: Option<String>,
 }
 
-pub fn tokenize(src: &str) -> (Vec<(Token, Range<usize>)>, Vec<LexError>) {
+pub fn tokenize(src: &str) -> (Vec<(Token<'_>, Range<usize>)>, Vec<LexError>) {
     let mut tokens = vec![];
     let mut errors = vec![];
 

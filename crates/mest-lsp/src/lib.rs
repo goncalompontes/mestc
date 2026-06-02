@@ -1,10 +1,130 @@
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use bumpalo::Bump;
+use chumsky::input::Input;
+use chumsky::{Parser, input::Stream};
+use lasso::Rodeo;
+use logos::Logos;
+use mest_core::{
+    hir::Type,
+    parser::parser,
+    token::Token,
+    typecheck::{self, InferenceTree, Output},
+};
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
-use tower_lsp::{Client, LanguageServer, LspService, Server};
+use tower_lsp::{Client, LanguageServer};
 
-#[derive(Debug)]
-struct Backend {
+use mest_core::typecheck::Input as InferInput;
+
+struct AnnotationMap {
+    spans: BTreeMap<usize, (usize, Type)>,
+}
+
+impl AnnotationMap {
+    fn find_entry(&self, offset: usize) -> Option<(usize, usize, Type)> {
+        self.spans
+            .range(..=offset)
+            .filter(|(_, (end, _))| offset < *end)
+            .min_by_key(|(start, (end, _))| *end - *start)
+            .map(|(start, (end, ty))| (*start, *end, ty.clone()))
+    }
+}
+
+struct DocumentState {
+    text: String,
+    generation: u64,
+    annotations: Option<AnnotationMap>,
+}
+
+pub struct Backend {
     client: Client,
+    documents: Arc<Mutex<HashMap<Url, DocumentState>>>,
+}
+
+impl Backend {
+    pub fn new(client: Client) -> Self {
+        Self {
+            client,
+            documents: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+fn lsp_to_offset(text: &str, pos: Position) -> Option<usize> {
+    let mut offset = 0usize;
+    for _ in 0..pos.line {
+        offset = text[offset..].find('\n')? + offset + 1;
+    }
+    Some(offset + pos.character as usize)
+}
+
+fn offset_to_lsp(text: &str, offset: usize) -> Position {
+    let line = text[..offset].matches('\n').count() as u32;
+    let col_start = text[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let character = (offset - col_start) as u32;
+    Position::new(line, character)
+}
+
+fn build_annotations(source: &str) -> Option<AnnotationMap> {
+    let token_iter = Token::lexer(source).spanned().map(|(tok, span)| match tok {
+        Ok(tok) => (tok, span.into()),
+        Err(()) => (Token::Error, span.into()),
+    });
+
+    let token_stream =
+        Stream::from_iter(token_iter).map((0..source.len()).into(), |(t, s): (_, _)| (t, s));
+
+    let bump = Bump::new();
+    let mut rodeo = chumsky::extra::SimpleState(Rodeo::new());
+
+    let expr = match parser(&bump)
+        .parse_with_state(token_stream, &mut rodeo)
+        .into_result()
+    {
+        Ok(expr) => expr,
+        Err(_) => return None,
+    };
+
+    let result = typecheck::typecheck(&expr, &mut rodeo);
+
+    let mut map = AnnotationMap {
+        spans: BTreeMap::new(),
+    };
+    collect_infer_nodes(&result.tree, &mut map);
+    Some(map)
+}
+
+fn collect_infer_nodes(tree: &InferenceTree, map: &mut AnnotationMap) {
+    if let InferInput::Infer { expr, .. } = &tree.input {
+        if let Output::Type(ty) = &tree.output {
+            let range: std::ops::Range<usize> = expr.span.into_range();
+            map.spans.insert(range.start, (range.end, ty.clone()));
+        }
+    }
+    for child in &tree.children {
+        collect_infer_nodes(child, map);
+    }
+}
+
+impl Backend {
+    fn schedule_update(&self, uri: Url, text: String, generation: u64) {
+        let documents = self.documents.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            let annotations = build_annotations(&text);
+
+            let mut docs = documents.lock().unwrap();
+            if let Some(doc) = docs.get_mut(&uri) {
+                if doc.generation == generation {
+                    doc.annotations = annotations;
+                }
+            }
+        });
+    }
 }
 
 #[tower_lsp::async_trait]
@@ -12,8 +132,11 @@ impl LanguageServer for Backend {
     async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
+                text_document_sync: Some(TextDocumentSyncCapability::Kind(
+                    TextDocumentSyncKind::FULL,
+                )),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
-                completion_provider: Some(CompletionOptions::default()),
+                inlay_hint_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
             ..Default::default()
@@ -30,26 +153,150 @@ impl LanguageServer for Backend {
         Ok(())
     }
 
-    async fn completion(&self, _: CompletionParams) -> Result<Option<CompletionResponse>> {
-        Ok(Some(CompletionResponse::Array(vec![
-            CompletionItem::new_simple("Hello".to_string(), "Some detail".to_string()),
-            CompletionItem::new_simple("Bye".to_string(), "More detail".to_string()),
-        ])))
+    async fn did_open(&self, params: DidOpenTextDocumentParams) {
+        let uri = params.text_document.uri;
+        let text = params.text_document.text;
+
+        let annotations = build_annotations(&text);
+
+        let mut docs = self.documents.lock().unwrap();
+        docs.insert(
+            uri,
+            DocumentState {
+                text,
+                generation: 0,
+                annotations,
+            },
+        );
     }
 
-    async fn hover(&self, _: HoverParams) -> Result<Option<Hover>> {
+    async fn did_change(&self, params: DidChangeTextDocumentParams) {
+        let uri = params.text_document.uri;
+        let text = params.content_changes.into_iter().last().unwrap().text;
+
+        let gen_id = {
+            let mut docs = self.documents.lock().unwrap();
+            let doc = docs.entry(uri.clone()).or_insert(DocumentState {
+                text: String::new(),
+                generation: 0,
+                annotations: None,
+            });
+            doc.text = text.clone();
+            doc.generation += 1;
+            doc.generation
+        };
+
+        self.schedule_update(uri, text, gen_id);
+    }
+
+    async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        self.documents
+            .lock()
+            .unwrap()
+            .remove(&params.text_document.uri);
+    }
+
+    async fn completion(&self, _: CompletionParams) -> Result<Option<CompletionResponse>> {
+        Ok(None)
+    }
+
+    async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+
+        let text = {
+            let docs = self.documents.lock().unwrap();
+            match docs.get(&uri) {
+                Some(doc) => doc.text.clone(),
+                None => return Ok(None),
+            }
+        };
+
+        let offset = match lsp_to_offset(&text, pos) {
+            Some(o) => o,
+            None => return Ok(None),
+        };
+
+        let (range_start, range_end, ty_str) = {
+            let docs = self.documents.lock().unwrap();
+            let doc = match docs.get(&uri) {
+                Some(doc) => doc,
+                None => return Ok(None),
+            };
+            let annotations = match doc.annotations.as_ref() {
+                Some(a) => a,
+                None => return Ok(None),
+            };
+            match annotations.find_entry(offset) {
+                Some((start, end, ty)) => (start, end, ty.to_string()),
+                None => return Ok(None),
+            }
+        };
+
         Ok(Some(Hover {
-            contents: HoverContents::Scalar(MarkedString::String("You're hovering!".to_string())),
-            range: None,
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: format!("```mest\n: {}\n```", ty_str),
+            }),
+            range: Some(Range {
+                start: offset_to_lsp(&text, range_start),
+                end: offset_to_lsp(&text, range_end),
+            }),
         }))
     }
-}
 
-#[tokio::main]
-async fn main() {
-    let stdin = tokio::io::stdin();
-    let stdout = tokio::io::stdout();
+    async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
+        let uri = params.text_document.uri;
+        let range = params.range;
 
-    let (service, socket) = LspService::new(|client| Backend { client });
-    Server::new(stdin, stdout, socket).serve(service).await;
+        let text = {
+            let docs = self.documents.lock().unwrap();
+            match docs.get(&uri) {
+                Some(doc) => doc.text.clone(),
+                None => return Ok(None),
+            }
+        };
+
+        let entries = {
+            let docs = self.documents.lock().unwrap();
+            let doc = match docs.get(&uri) {
+                Some(doc) => doc,
+                None => return Ok(None),
+            };
+            let annotations = match doc.annotations.as_ref() {
+                Some(a) => a,
+                None => return Ok(None),
+            };
+
+            let result: Vec<_> = annotations
+                .spans
+                .iter()
+                .filter(|(_, (end, _))| {
+                    let pos = offset_to_lsp(&doc.text, *end);
+                    pos.line >= range.start.line && pos.line <= range.end.line
+                })
+                .map(|(start, (end, ty))| (*start, *end, ty.clone()))
+                .collect();
+            result
+        };
+
+        let hints: Vec<InlayHint> = entries
+            .into_iter()
+            .map(|(_, end, ty)| {
+                let pos = offset_to_lsp(&text, end);
+                InlayHint {
+                    position: pos,
+                    label: InlayHintLabel::String(format!(": {}", ty)),
+                    kind: Some(InlayHintKind::TYPE),
+                    padding_left: Some(true),
+                    padding_right: None,
+                    text_edits: None,
+                    tooltip: None,
+                    data: None,
+                }
+            })
+            .collect();
+
+        Ok(Some(hints))
+    }
 }

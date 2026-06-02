@@ -682,6 +682,10 @@ dependencies = [
 name = "mest-lsp"
 version = "0.4.0"
 dependencies = [
+ "bumpalo",
+ "chumsky",
+ "lasso",
+ "logos",
  "mest-core",
  "tokio",
  "tower-lsp",
