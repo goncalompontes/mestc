@@ -1,12 +1,15 @@
+use std::fmt;
+
 use chumsky::span::SimpleSpan;
 use derive_more::From;
+use itertools::Itertools;
 
 use crate::ast::{BinOp, Ident, Literal, UnaryOp};
 
-#[derive(Debug, Clone, Copy, From)]
-pub struct TypeVar(u64);
+#[derive(Debug, Clone, Copy, From, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TypeVar(pub u64);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Type {
     Var(TypeVar),
     Arrow(Box<Type>, Box<Type>),
@@ -68,4 +71,23 @@ pub enum TPat<'bump> {
     Var(Ident, Type),
     Lit(Literal),
     Or(&'bump TPat<'bump>, &'bump TPat<'bump>),
+}
+
+impl fmt::Display for TypeVar {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "α<{}>", self.0)
+    }
+}
+
+impl fmt::Display for Type {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Type::Var(type_var) => write!(f, "{}", type_var),
+            Type::Arrow(from, to) => write!(f, "({}) -> {}", from, to),
+            Type::Int => write!(f, "Int"),
+            Type::Float => write!(f, "Float"),
+            Type::Bool => write!(f, "Bool"),
+            Type::Tuple(items) => write!(f, "({})", items.iter().format(",")),
+        }
+    }
 }

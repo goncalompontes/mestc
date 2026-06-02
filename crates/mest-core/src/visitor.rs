@@ -9,7 +9,7 @@ pub trait Visitor<'bump, Ctx>: Sized {
     fn walk_expr(&mut self, expr: &'bump Expr<'bump>, ctx: &mut Ctx) {
         self.visit_expr(expr, ctx);
         match &*expr.kind {
-            ExprKind::Literal(_) | ExprKind::Ident(_) => {}
+            ExprKind::Literal(_) | ExprKind::Var(_) => {}
             ExprKind::If {
                 cond,
                 then_expr,
@@ -70,79 +70,162 @@ pub trait Visitor<'bump, Ctx>: Sized {
 pub struct PrintCtx<'a> {
     pub rodeo: &'a Rodeo,
     pub indent: usize,
+    pub output: String,
 }
 
 impl<'a> PrintCtx<'a> {
     pub fn new(rodeo: &'a Rodeo) -> Self {
-        Self { rodeo, indent: 0 }
+        Self {
+            rodeo,
+            indent: 0,
+            output: String::new(),
+        }
     }
 }
 
 pub struct AstPrinter;
 
+pub struct DisplayExpr<'a, 'bump> {
+    expr: &'bump Expr<'bump>,
+    rodeo: &'a Rodeo,
+}
+
+impl std::fmt::Display for DisplayExpr<'_, '_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut ctx = PrintCtx::new(self.rodeo);
+        AstPrinter.visit_expr(self.expr, &mut ctx);
+        f.write_str(&ctx.output)
+    }
+}
+
 impl AstPrinter {
-    pub fn print_expr<'bump>(expr: &'bump Expr<'bump>, ctx: &mut PrintCtx) {
-        AstPrinter.visit_expr(expr, ctx);
+    pub fn print_expr<'bump, 'a>(expr: &'bump Expr<'bump>, rodeo: &'a Rodeo) -> DisplayExpr<'a, 'bump> {
+        DisplayExpr { expr, rodeo }
+    }
+}
+
+impl<'bump> Expr<'bump> {
+    pub fn display<'a>(&'bump self, rodeo: &'a Rodeo) -> DisplayExpr<'a, 'bump> {
+        DisplayExpr { expr: self, rodeo }
+    }
+}
+
+fn indent(level: usize) -> String {
+    "  ".repeat(level)
+}
+
+fn binop_prec(op: &BinOp) -> u8 {
+    match op {
+        BinOp::Or => 1,
+        BinOp::And => 2,
+        BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => 3,
+        BinOp::Add | BinOp::Sub => 4,
+        BinOp::Mul | BinOp::Div => 5,
+        BinOp::Pow => 6,
+    }
+}
+
+fn needs_parens_simple(expr: &Expr) -> bool {
+    matches!(
+        &*expr.kind,
+        ExprKind::If { .. }
+            | ExprKind::Let { .. }
+            | ExprKind::Match { .. }
+            | ExprKind::BinOp { .. }
+            | ExprKind::UnaryOp { .. }
+    )
+}
+
+fn parexpr<'bump>(
+    visitor: &mut AstPrinter,
+    expr: &'bump Expr<'bump>,
+    ctx: &mut PrintCtx,
+    wrap: bool,
+) {
+    if wrap && needs_parens_simple(expr) {
+        ctx.output.push('(');
+        visitor.visit_expr(expr, ctx);
+        ctx.output.push(')');
+    } else {
+        visitor.visit_expr(expr, ctx);
+    }
+}
+
+fn parexpr_binop<'bump>(
+    visitor: &mut AstPrinter,
+    child: &'bump Expr<'bump>,
+    parent_op: &BinOp,
+    ctx: &mut PrintCtx,
+) {
+    let needs_parens = match &*child.kind {
+        ExprKind::BinOp { op: child_op, .. } => binop_prec(child_op) < binop_prec(parent_op),
+        _ => needs_parens_simple(child),
+    };
+    if needs_parens {
+        ctx.output.push('(');
+        visitor.visit_expr(child, ctx);
+        ctx.output.push(')');
+    } else {
+        visitor.visit_expr(child, ctx);
     }
 }
 
 impl<'bump> Visitor<'bump, PrintCtx<'_>> for AstPrinter {
     fn visit_expr(&mut self, expr: &'bump Expr<'bump>, ctx: &mut PrintCtx<'_>) {
-        let indent = "  ".repeat(ctx.indent);
         match &*expr.kind {
             ExprKind::Literal(lit) => match lit {
-                Literal::Int(n) => println!("{indent}Int({n})"),
-                Literal::Float(f) => println!("{indent}Float({f})"),
-                Literal::Bool(b) => println!("{indent}Bool({b})"),
+                Literal::Int(n) => ctx.output.push_str(&n.to_string()),
+                Literal::Float(f) => ctx.output.push_str(&f.to_string()),
+                Literal::Bool(b) => ctx.output.push_str(if *b { "true" } else { "false" }),
             },
-            ExprKind::Ident(ident) => {
-                println!("{indent}Ident({})", ctx.rodeo.resolve(&ident.0));
+            ExprKind::Var(ident) => {
+                ctx.output.push_str(ctx.rodeo.resolve(&ident.0));
             }
             ExprKind::If {
                 cond,
                 then_expr,
                 else_expr,
             } => {
-                println!("{indent}If");
-                ctx.indent += 1;
+                ctx.output.push_str("if ");
                 self.visit_expr(cond, ctx);
-                println!("{}Then", "  ".repeat(ctx.indent - 1));
+                ctx.output.push('\n');
+                ctx.output.push_str(&indent(ctx.indent));
+                ctx.output.push_str("then\n");
+                ctx.output.push_str(&indent(ctx.indent + 1));
                 self.visit_expr(then_expr, ctx);
-                println!("{}Else", "  ".repeat(ctx.indent - 1));
+                ctx.output.push('\n');
+                ctx.output.push_str(&indent(ctx.indent));
+                ctx.output.push_str("else\n");
+                ctx.output.push_str(&indent(ctx.indent + 1));
                 self.visit_expr(else_expr, ctx);
-                ctx.indent -= 1;
             }
             ExprKind::BinOp { op, lhs, rhs } => {
                 let op_str = match op {
-                    BinOp::Eq => "==",
-                    BinOp::NotEq => "!=",
-                    BinOp::Lt => "<",
-                    BinOp::Gt => ">",
-                    BinOp::Le => "<=",
-                    BinOp::Ge => ">=",
-                    BinOp::And => "&&",
-                    BinOp::Or => "||",
-                    BinOp::Add => "+",
-                    BinOp::Sub => "-",
-                    BinOp::Mul => "*",
-                    BinOp::Div => "/",
-                    BinOp::Pow => "^",
+                    BinOp::Eq => " == ",
+                    BinOp::NotEq => " != ",
+                    BinOp::Lt => " < ",
+                    BinOp::Gt => " > ",
+                    BinOp::Le => " <= ",
+                    BinOp::Ge => " >= ",
+                    BinOp::And => " && ",
+                    BinOp::Or => " || ",
+                    BinOp::Add => " + ",
+                    BinOp::Sub => " - ",
+                    BinOp::Mul => " * ",
+                    BinOp::Div => " / ",
+                    BinOp::Pow => " ^ ",
                 };
-                println!("{indent}BinOp({op_str})");
-                ctx.indent += 1;
-                self.visit_expr(lhs, ctx);
-                self.visit_expr(rhs, ctx);
-                ctx.indent -= 1;
+                parexpr_binop(self, lhs, op, ctx);
+                ctx.output.push_str(op_str);
+                parexpr_binop(self, rhs, op, ctx);
             }
             ExprKind::UnaryOp { op, rhs } => {
                 let op_str = match op {
                     UnaryOp::Neg => "-",
                     UnaryOp::Not => "!",
                 };
-                println!("{indent}UnaryOp({op_str})");
-                ctx.indent += 1;
-                self.visit_expr(rhs, ctx);
-                ctx.indent -= 1;
+                ctx.output.push_str(op_str);
+                parexpr(self, rhs, ctx, true);
             }
             ExprKind::Let {
                 name,
@@ -151,59 +234,63 @@ impl<'bump> Visitor<'bump, PrintCtx<'_>> for AstPrinter {
                 rec,
             } => {
                 if *rec {
-                    println!("{indent}LetRec({})", ctx.rodeo.resolve(&name.0));
+                    ctx.output.push_str("let rec ");
                 } else {
-                    println!("{indent}Let({})", ctx.rodeo.resolve(&name.0));
+                    ctx.output.push_str("let ");
                 }
+                ctx.output.push_str(ctx.rodeo.resolve(&name.0));
+                ctx.output.push_str(" = ");
                 ctx.indent += 1;
                 self.visit_expr(value, ctx);
-                self.visit_expr(body, ctx);
+                ctx.output.push('\n');
                 ctx.indent -= 1;
+                ctx.output.push_str(&indent(ctx.indent));
+                ctx.output.push_str("in\n");
+                ctx.output.push_str(&indent(ctx.indent + 1));
+                self.visit_expr(body, ctx);
             }
             ExprKind::Match { scrutinee, arms } => {
-                println!("{indent}Match");
-                ctx.indent += 1;
+                ctx.output.push_str("match ");
                 self.visit_expr(scrutinee, ctx);
-                for (pat, body) in arms.iter() {
+                ctx.output.push('\n');
+                for (i, (pat, body)) in arms.iter().enumerate() {
+                    ctx.output.push_str(&indent(ctx.indent));
+                    ctx.output.push_str("| ");
                     self.visit_pat(pat, ctx);
+                    ctx.output.push_str(" => ");
                     self.visit_expr(body, ctx);
+                    if i < arms.len() - 1 {
+                        ctx.output.push('\n');
+                    }
                 }
-                ctx.indent -= 1;
             }
             ExprKind::Abs { param, body } => {
-                println!("{indent}Lambda({})", ctx.rodeo.resolve(&param.0));
-                ctx.indent += 1;
+                ctx.output.push('|');
+                ctx.output.push_str(ctx.rodeo.resolve(&param.0));
+                ctx.output.push_str("| ");
                 self.visit_expr(body, ctx);
-                ctx.indent -= 1;
             }
             ExprKind::App { func, arg } => {
-                println!("{indent}App");
-                ctx.indent += 1;
-                self.visit_expr(func, ctx);
-                self.visit_expr(arg, ctx);
-                ctx.indent -= 1;
+                parexpr(self, func, ctx, true);
+                ctx.output.push(' ');
+                parexpr(self, arg, ctx, true);
             }
         }
     }
 
     fn visit_pat(&mut self, pat: &'bump Pat<'bump>, ctx: &mut PrintCtx<'_>) {
-        let indent = "  ".repeat(ctx.indent);
         match pat {
-            Pat::Wildcard => println!("{indent}Wildcard"),
-            Pat::Var(ident) => {
-                println!("{indent}Var({})", ctx.rodeo.resolve(&ident.0));
-            }
+            Pat::Wildcard => ctx.output.push('_'),
+            Pat::Var(ident) => ctx.output.push_str(ctx.rodeo.resolve(&ident.0)),
             Pat::Lit(lit) => match lit {
-                Literal::Int(n) => println!("{indent}Lit(Int({n}))"),
-                Literal::Float(f) => println!("{indent}Lit(Float({f}))"),
-                Literal::Bool(b) => println!("{indent}Lit(Bool({b}))"),
+                Literal::Int(n) => ctx.output.push_str(&n.to_string()),
+                Literal::Float(f) => ctx.output.push_str(&f.to_string()),
+                Literal::Bool(b) => ctx.output.push_str(if *b { "true" } else { "false" }),
             },
             Pat::Or(a, b) => {
-                println!("{indent}Or");
-                ctx.indent += 1;
                 self.visit_pat(a, ctx);
+                ctx.output.push_str(" | ");
                 self.visit_pat(b, ctx);
-                ctx.indent -= 1;
             }
         }
     }

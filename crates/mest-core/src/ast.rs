@@ -12,7 +12,7 @@ pub enum Literal {
     Bool(bool),
 }
 
-#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Ident(pub Spur);
 
 #[derive(Debug, Clone)]
@@ -63,7 +63,7 @@ impl<'bump> Deref for Expr<'bump> {
 #[derive(Debug, Clone)]
 pub enum ExprKind<'bump> {
     Literal(Literal),
-    Ident(Ident),
+    Var(Ident),
     If {
         cond: Expr<'bump>,
         then_expr: Expr<'bump>,
@@ -168,7 +168,7 @@ impl<'bump> ExprKind<'bump> {
     }
 
     pub fn ident(bump: &'bump Bump, span: SimpleSpan, name: Ident) -> Expr<'bump> {
-        Self::node(bump.alloc(ExprKind::Ident(name)), span)
+        Self::node(bump.alloc(ExprKind::Var(name)), span)
     }
 
     pub fn if_expr(
@@ -273,7 +273,7 @@ impl<'bump> ExprKind<'bump> {
             ExprKind::Literal(Literal::Int(v)) => Ok(Value::Int(*v)),
             ExprKind::Literal(Literal::Float(v)) => Ok(Value::Float(*v)),
 
-            ExprKind::Ident(ident) => {
+            ExprKind::Var(ident) => {
                 let thunk = env.get(ident).ok_or_else(|| {
                     EvalError::UnboundVariable(rodeo.resolve(&ident.0).to_owned())
                 })?;
