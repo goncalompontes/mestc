@@ -92,6 +92,40 @@ impl InferenceTree {
             children,
         }
     }
+
+    pub fn display_tree(&self) -> String {
+        let mut buf = String::new();
+        self.write(&mut buf, &[]);
+        buf
+    }
+
+    fn write(&self, buf: &mut String, prefix: &[bool]) {
+        use std::fmt::Write;
+
+        for &is_last in prefix.iter().take(prefix.len().saturating_sub(1)) {
+            if is_last {
+                buf.push_str("    ");
+            } else {
+                buf.push_str("│   ");
+            }
+        }
+        if let Some(&last) = prefix.last() {
+            if last {
+                buf.push_str("└── ");
+            } else {
+                buf.push_str("├── ");
+            }
+        }
+
+        writeln!(buf, "{} {} {}", self.rule, self.input, self.output).unwrap();
+
+        for (i, child) in self.children.iter().enumerate() {
+            let is_last = i == self.children.len() - 1;
+            let mut child_prefix = prefix.to_vec();
+            child_prefix.push(is_last);
+            child.write(buf, &child_prefix);
+        }
+    }
 }
 
 pub struct TypeInference<'rodeo> {
@@ -207,7 +241,8 @@ impl<'rodeo> TypeInference<'rodeo> {
                 // then we just compose the substitutions together
                 let final_subst = to.compose(&from);
                 let output = self.pretty_subst(&final_subst);
-                let tree = InferenceTree::new("Unify-Arrow", &input, &output, vec![from_tree, to_tree]);
+                let tree =
+                    InferenceTree::new("Unify-Arrow", &input, &output, vec![from_tree, to_tree]);
                 Ok((final_subst, tree))
             }
             (Type::Tuple(ts1), Type::Tuple(ts2)) => {
@@ -405,7 +440,12 @@ impl<'rodeo> TypeInference<'rodeo> {
         let final_ty = Self::apply_type(&final_subst, &then_ty);
 
         let output = format!("{}", final_ty);
-        let tree = InferenceTree::new("T-If", &input, &output, vec![tree1, tree2, tree3, cond_tree, eq_tree]);
+        let tree = InferenceTree::new(
+            "T-If",
+            &input,
+            &output,
+            vec![tree1, tree2, tree3, cond_tree, eq_tree],
+        );
         Ok((final_subst, final_ty, tree))
     }
 
@@ -443,7 +483,12 @@ impl<'rodeo> TypeInference<'rodeo> {
         let final_ty = Self::apply_type(&final_subst, &result_ty);
 
         let output = format!("{}", final_ty);
-        let tree = InferenceTree::new("T-BinOp", &input, &output, vec![tree1, tree2, lhs_tree, rhs_tree]);
+        let tree = InferenceTree::new(
+            "T-BinOp",
+            &input,
+            &output,
+            vec![tree1, tree2, lhs_tree, rhs_tree],
+        );
         Ok((final_subst, final_ty, tree))
     }
 
@@ -495,15 +540,19 @@ impl<'rodeo> TypeInference<'rodeo> {
             Pat::Or(a, b) => {
                 let (ty_a, mut bindings) = self.infer_pat(a);
                 let (ty_b, bindings_b) = self.infer_pat(b);
-                let (s, _) = self.unify(&ty_a, &ty_b).unwrap_or((Subst::empty(), InferenceTree::new("", "", "", vec![])));
+                let (s, _) = self
+                    .unify(&ty_a, &ty_b)
+                    .unwrap_or((Subst::empty(), InferenceTree::new("", "", "", vec![])));
                 let unified = Self::apply_type(&s, &ty_a);
-                bindings.extend(
-                    bindings_b
-                        .into_iter()
-                        .map(|(id, scheme)| {
-                            (id, Scheme { type_vars: scheme.type_vars, ty: Self::apply_type(&s, &scheme.ty) })
-                        }),
-                );
+                bindings.extend(bindings_b.into_iter().map(|(id, scheme)| {
+                    (
+                        id,
+                        Scheme {
+                            type_vars: scheme.type_vars,
+                            ty: Self::apply_type(&s, &scheme.ty),
+                        },
+                    )
+                }));
                 (unified, bindings)
             }
         }

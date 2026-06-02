@@ -1,0 +1,1 @@
+match (if true then 1 else 2) | 0 => false | n => n == 1

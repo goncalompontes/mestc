@@ -106,7 +106,7 @@ fn lex(src: &str) {
     }
 }
 
-fn parse(src: &str) {
+fn parse(src: &str) -> Result<(), ()> {
     let token_iter = Token::lexer(src).spanned().map(|(tok, span)| match tok {
         Ok(tok) => (tok, span.into()),
         Err(()) => (Token::Error, span.into()),
@@ -139,14 +139,16 @@ fn parse(src: &str) {
                     .eprint(Source::from(src))
                     .unwrap();
             }
+            Err(())
         }
         Ok(expr) => {
             println!("{}", AstPrinter::print_expr(&expr, &rodeo));
+            Ok(())
         }
     }
 }
 
-fn check(src: &str) {
+fn check(src: &str) -> Result<(), ()> {
     let token_iter = Token::lexer(src).spanned().map(|(tok, span)| match tok {
         Ok(tok) => (tok, span.into()),
         Err(()) => (Token::Error, span.into()),
@@ -177,41 +179,59 @@ fn check(src: &str) {
                     .eprint(Source::from(src))
                     .unwrap();
             }
+            Err(())
         }
-        Ok(expr) => {
-            match typecheck::infer_type(&expr, &mut rodeo) {
-                Ok(ty) => {
-                    println!("{} : {}", AstPrinter::print_expr(&expr, &rodeo), ty);
-                }
-                Err(()) => {
-                    eprintln!("type inference failed");
-                }
+        Ok(expr) => match typecheck::run_inference(&expr, &mut rodeo) {
+            Ok(tree) => {
+                let ty = typecheck::infer_type(&expr, &mut rodeo).map_err(|_| ())?;
+                println!("{} : {}", AstPrinter::print_expr(&expr, &rodeo), ty);
+                println!();
+                println!("{}", tree.display_tree());
+                Ok(())
             }
-        }
+            Err(()) => {
+                eprintln!("type inference failed");
+                Err(())
+            }
+        },
     }
 }
 
-fn main() {
+fn main() -> Result<(), ()> {
     let cli = Cli::parse();
 
     match cli.command {
         Command::Eval { expr } => {
             run(&expr);
+            Ok(())
         }
         Command::Run { path } => match std::fs::read_to_string(&path) {
-            Ok(src) => run(&src),
-            Err(err) => eprintln!("error reading {}: {}", path.display(), err),
+            Ok(src) => {
+                run(&src);
+                Ok(())
+            }
+            Err(err) => {
+                eprintln!("error reading {}: {}", path.display(), err);
+                Err(())
+            }
         },
         Command::Lex { expr } => {
             lex(&expr);
+            Ok(())
         }
         Command::Parse { path } => match std::fs::read_to_string(&path) {
             Ok(src) => parse(&src),
-            Err(err) => eprintln!("error reading {}: {}", path.display(), err),
+            Err(err) => {
+                eprintln!("error reading {}: {}", path.display(), err);
+                Err(())
+            }
         },
         Command::Check { path } => match std::fs::read_to_string(&path) {
             Ok(src) => check(&src),
-            Err(err) => eprintln!("error reading {}: {}", path.display(), err),
+            Err(err) => {
+                eprintln!("error reading {}: {}", path.display(), err);
+                Err(())
+            }
         },
     }
 }
