@@ -282,6 +282,55 @@ fn check_match_type_error() {
     assert!(stderr.contains("Type mismatch"), "stderr: {stderr:?}");
 }
 
+// ── let with tuple bind patterns ─────────────────────────────────
+
+#[test]
+fn check_let_tuple_bind() {
+    let path = fixture_path("check", "let_tuple_bind.mest");
+    let path_s = path.to_str().unwrap();
+    let (stdout, stderr, ok) = run_mest(&["check", path_s]);
+    assert!(ok, "check let_tuple_bind failed\nstderr: {stderr}");
+    assert!(stdout.contains(": Bool"), "stdout: {stdout:?}");
+}
+
+#[test]
+fn check_let_nested_tuple() {
+    let path = fixture_path("check", "let_nested_tuple.mest");
+    let path_s = path.to_str().unwrap();
+    let (stdout, stderr, ok) = run_mest(&["check", path_s]);
+    assert!(ok, "check let_nested_tuple failed\nstderr: {stderr}");
+    assert!(stdout.contains(": Int"), "stdout: {stdout:?}");
+}
+
+// ── let with `and` ───────────────────────────────────────────────
+
+#[test]
+fn check_let_and() {
+    let path = fixture_path("check", "let_and.mest");
+    let path_s = path.to_str().unwrap();
+    let (stdout, stderr, ok) = run_mest(&["check", path_s]);
+    assert!(ok, "check let_and failed\nstderr: {stderr}");
+    assert!(stdout.contains(": Bool"), "stdout: {stdout:?}");
+}
+
+#[test]
+fn check_let_tuple_and() {
+    let path = fixture_path("check", "let_tuple_and.mest");
+    let path_s = path.to_str().unwrap();
+    let (stdout, stderr, ok) = run_mest(&["check", path_s]);
+    assert!(ok, "check let_tuple_and failed\nstderr: {stderr}");
+    assert!(stdout.contains(": Int"), "stdout: {stdout:?}");
+}
+
+#[test]
+fn check_let_and_rec() {
+    let path = fixture_path("check", "let_and_rec.mest");
+    let path_s = path.to_str().unwrap();
+    let (stdout, stderr, ok) = run_mest(&["check", path_s]);
+    assert!(ok, "check let_and_rec failed\nstderr: {stderr}");
+    assert!(stdout.contains(": Bool"), "stdout: {stdout:?}");
+}
+
 // ── let rec tests ─────────────────────────────────────────────────
 
 #[test]
@@ -424,6 +473,46 @@ fn run_if_compare() {
     let (stdout, stderr, ok) = run_mest(&["run", path_s]);
     assert!(ok, "run if_compare failed\nstderr: {stderr}");
     assert_eq!(stdout.trim(), "10");
+}
+
+// ── run with tuple bind patterns ─────────────────────────────────
+
+#[test]
+fn run_let_tuple_bind() {
+    let path = fixture_path("run", "let_tuple_bind.mest");
+    let path_s = path.to_str().unwrap();
+    let (stdout, stderr, ok) = run_mest(&["run", path_s]);
+    assert!(ok, "run let_tuple_bind failed\nstderr: {stderr}");
+    assert_eq!(stdout.trim(), "1");
+}
+
+// ── run with `and` ───────────────────────────────────────────────
+
+#[test]
+fn run_let_and() {
+    let path = fixture_path("run", "let_and.mest");
+    let path_s = path.to_str().unwrap();
+    let (stdout, stderr, ok) = run_mest(&["run", path_s]);
+    assert!(ok, "run let_and failed\nstderr: {stderr}");
+    assert_eq!(stdout.trim(), "3");
+}
+
+#[test]
+fn run_let_tuple_and() {
+    let path = fixture_path("run", "let_tuple_and.mest");
+    let path_s = path.to_str().unwrap();
+    let (stdout, stderr, ok) = run_mest(&["run", path_s]);
+    assert!(ok, "run let_tuple_and failed\nstderr: {stderr}");
+    assert_eq!(stdout.trim(), "6");
+}
+
+#[test]
+fn run_let_and_rec() {
+    let path = fixture_path("run", "let_and_rec.mest");
+    let path_s = path.to_str().unwrap();
+    let (stdout, stderr, ok) = run_mest(&["run", path_s]);
+    assert!(ok, "run let_and_rec failed\nstderr: {stderr}");
+    assert_eq!(stdout.trim(), "1");
 }
 
 // ── parse command ─────────────────────────────────────────────────

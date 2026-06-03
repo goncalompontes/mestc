@@ -1,10 +1,13 @@
-use crate::ast::{BinOp, Expr, ExprKind, Literal, Pat, PatKind, UnaryOp};
+use crate::ast::{
+    BinOp, BindPat, BindPatKind, Binding, Expr, ExprKind, Literal, Pat, PatKind, UnaryOp,
+};
 use lasso::Rodeo;
 
 pub trait Visitor<'bump, Ctx>: Sized {
     fn visit_expr(&mut self, _expr: &'bump Expr<'bump>, _ctx: &mut Ctx) {}
-
     fn visit_pat(&mut self, _pat: &'bump Pat<'bump>, _ctx: &mut Ctx) {}
+    fn visit_binding(&mut self, _binding: &'bump Binding<'bump>, _ctx: &mut Ctx) {}
+    fn visit_bind_pat(&mut self, _pat: &'bump BindPat<'bump>, _ctx: &mut Ctx) {}
 
     fn walk_expr(&mut self, expr: &'bump Expr<'bump>, ctx: &mut Ctx) {
         self.visit_expr(expr, ctx);
@@ -27,8 +30,8 @@ pub trait Visitor<'bump, Ctx>: Sized {
                 self.walk_expr(rhs, ctx);
             }
             ExprKind::Let { bindings, body, .. } => {
-                for (_, value) in bindings.iter() {
-                    self.walk_expr(value, ctx);
+                for binding in bindings.iter() {
+                    self.walk_binding(binding, ctx);
                 }
                 self.walk_expr(body, ctx);
             }
@@ -70,6 +73,24 @@ pub trait Visitor<'bump, Ctx>: Sized {
             }
         }
     }
+
+    fn walk_binding(&mut self, binding: &'bump Binding<'bump>, ctx: &mut Ctx) {
+        self.visit_binding(binding, ctx);
+        self.walk_bind_pat(&binding.pat, ctx);
+        self.walk_expr(&binding.value, ctx);
+    }
+
+    fn walk_bind_pat(&mut self, pat: &'bump BindPat<'bump>, ctx: &mut Ctx) {
+        self.visit_bind_pat(pat, ctx);
+        match pat.kind {
+            BindPatKind::Tuple(bind_pats) => {
+                bind_pats
+                    .iter()
+                    .for_each(|pat| self.walk_bind_pat(pat, ctx));
+            }
+            _ => {}
+        }
+    }
 }
 
 // TODO: VisitMut requires `kind: &'bump mut ExprKind` on `Expr` to walk children.
@@ -107,7 +128,10 @@ impl std::fmt::Display for DisplayExpr<'_, '_> {
 }
 
 impl AstPrinter {
-    pub fn print_expr<'bump, 'a>(expr: &'bump Expr<'bump>, rodeo: &'a Rodeo) -> DisplayExpr<'a, 'bump> {
+    pub fn print_expr<'bump, 'a>(
+        expr: &'bump Expr<'bump>,
+        rodeo: &'a Rodeo,
+    ) -> DisplayExpr<'a, 'bump> {
         DisplayExpr { expr, rodeo }
     }
 }
@@ -200,19 +224,23 @@ fn write_inline(f: &mut std::fmt::Formatter, kind: &ExprKind, rodeo: &Rodeo) -> 
             f.write_str(op_str)?;
             write_inline(f, &**rhs, rodeo)
         }
-        ExprKind::Let { bindings, body, rec } => {
-            if *rec {
+        ExprKind::Let { bindings, body } => {
+            let rec = bindings.first().map_or(false, |b| b.rec);
+            if rec {
                 write!(f, "let rec ")?;
             } else {
                 write!(f, "let ")?;
             }
-            for (i, (name, value)) in bindings.iter().enumerate() {
-                if i > 0 { write!(f, " and ")?; }
-                write!(f, "{} = ", rodeo.resolve(&name.name))?;
-                write_inline(f, &**value, rodeo)?;
+            for (i, binding) in bindings.iter().enumerate() {
+                if i > 0 {
+                    write!(f, " and ")?;
+                }
+                write_bind_pat(f, &binding.pat, rodeo)?;
+                write!(f, " = ")?;
+                write_inline(f, &*binding.value.kind, rodeo)?;
             }
             write!(f, " in ")?;
-            write_inline(f, &**body, rodeo)
+            write_inline(f, &*body.kind, rodeo)
         }
         ExprKind::Match { scrutinee, arms } => {
             write!(f, "match ")?;
@@ -232,7 +260,13 @@ fn write_inline(f: &mut std::fmt::Formatter, kind: &ExprKind, rodeo: &Rodeo) -> 
             write_inline(f, &**body, rodeo)
         }
         ExprKind::App { func, arg } => {
-            let func_need_paren = matches!(&**func, ExprKind::Abs { .. } | ExprKind::If { .. } | ExprKind::Let { .. } | ExprKind::Match { .. });
+            let func_need_paren = matches!(
+                &**func,
+                ExprKind::Abs { .. }
+                    | ExprKind::If { .. }
+                    | ExprKind::Let { .. }
+                    | ExprKind::Match { .. }
+            );
             if func_need_paren {
                 write!(f, "(")?;
                 write_inline(f, &**func, rodeo)?;
@@ -241,7 +275,13 @@ fn write_inline(f: &mut std::fmt::Formatter, kind: &ExprKind, rodeo: &Rodeo) -> 
                 write_inline(f, &**func, rodeo)?;
             }
             write!(f, " ")?;
-            let arg_need_paren = matches!(&**arg, ExprKind::Abs { .. } | ExprKind::If { .. } | ExprKind::Let { .. } | ExprKind::Match { .. });
+            let arg_need_paren = matches!(
+                &**arg,
+                ExprKind::Abs { .. }
+                    | ExprKind::If { .. }
+                    | ExprKind::Let { .. }
+                    | ExprKind::Match { .. }
+            );
             if arg_need_paren {
                 write!(f, "(")?;
                 write_inline(f, &**arg, rodeo)?;
@@ -254,7 +294,9 @@ fn write_inline(f: &mut std::fmt::Formatter, kind: &ExprKind, rodeo: &Rodeo) -> 
         ExprKind::Tuple(items) => {
             write!(f, "(")?;
             for (i, item) in items.iter().enumerate() {
-                if i > 0 { write!(f, ", ")?; }
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
                 write_inline(f, &**item, rodeo)?;
             }
             write!(f, ")")
@@ -262,7 +304,28 @@ fn write_inline(f: &mut std::fmt::Formatter, kind: &ExprKind, rodeo: &Rodeo) -> 
     }
 }
 
-fn parexpr_inline(expr: &Expr, parent_op: &BinOp, rodeo: &Rodeo, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+fn write_bind_pat(f: &mut std::fmt::Formatter, pat: &BindPat, rodeo: &Rodeo) -> std::fmt::Result {
+    match pat.kind {
+        BindPatKind::Var(ident) => f.write_str(rodeo.resolve(&ident.name)),
+        BindPatKind::Tuple(pats) => {
+            write!(f, "(")?;
+            for (i, p) in pats.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write_bind_pat(f, p, rodeo)?;
+            }
+            write!(f, ")")
+        }
+    }
+}
+
+fn parexpr_inline(
+    expr: &Expr,
+    parent_op: &BinOp,
+    rodeo: &Rodeo,
+    f: &mut std::fmt::Formatter,
+) -> std::fmt::Result {
     match &**expr {
         ExprKind::BinOp { op: child_op, .. } if binop_prec(child_op) < binop_prec(parent_op) => {
             write!(f, "(")?;
@@ -290,7 +353,9 @@ fn pat_write_inline(pat: &Pat, rodeo: &Rodeo, f: &mut std::fmt::Formatter) -> st
         PatKind::Tuple(pats) => {
             write!(f, "(")?;
             for (i, p) in pats.iter().enumerate() {
-                if i > 0 { write!(f, ", ")?; }
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
                 pat_write_inline(p, rodeo, f)?;
             }
             write!(f, ")")
@@ -298,7 +363,11 @@ fn pat_write_inline(pat: &Pat, rodeo: &Rodeo, f: &mut std::fmt::Formatter) -> st
     }
 }
 
-fn write_minimized(f: &mut std::fmt::Formatter, kind: &ExprKind, rodeo: &Rodeo) -> std::fmt::Result {
+fn write_minimized(
+    f: &mut std::fmt::Formatter,
+    kind: &ExprKind,
+    rodeo: &Rodeo,
+) -> std::fmt::Result {
     match kind {
         ExprKind::Literal(lit) => match lit {
             Literal::Int(n) => write!(f, "{n}"),
@@ -345,15 +414,15 @@ fn write_minimized(f: &mut std::fmt::Formatter, kind: &ExprKind, rodeo: &Rodeo) 
             }
             write_minimized(f, &**rhs, rodeo)
         }
-        ExprKind::Let { bindings, rec, .. } => {
-            if *rec {
+        ExprKind::Let { bindings, .. } => {
+            let rec = bindings.first().map_or(false, |b| b.rec);
+            if rec {
                 write!(f, "let rec ")?;
             } else {
                 write!(f, "let ")?;
             }
-            if let Some((name, value)) = bindings.first() {
-                write!(f, "{} = ", rodeo.resolve(&name.name))?;
-                write_minimized(f, &**value, rodeo)?;
+            if let Some(binding) = bindings.first() {
+                write_minimized(f, &*binding.value.kind, rodeo)?;
             }
             if bindings.len() > 1 {
                 write!(f, " and ...")?;
@@ -388,7 +457,9 @@ fn write_minimized(f: &mut std::fmt::Formatter, kind: &ExprKind, rodeo: &Rodeo) 
         ExprKind::Tuple(items) => {
             write!(f, "(")?;
             for (i, item) in items.iter().enumerate() {
-                if i > 0 { write!(f, ", ")?; }
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
                 write_minimized(f, &**item, rodeo)?;
             }
             write!(f, ")")
@@ -509,18 +580,21 @@ impl<'bump> Visitor<'bump, PrintCtx<'_>> for AstPrinter {
                 ctx.output.push_str(op_str);
                 parexpr(self, rhs, ctx, true);
             }
-            ExprKind::Let { bindings, body, rec } => {
-                if *rec {
+            ExprKind::Let { bindings, body } => {
+                let rec = bindings.first().map_or(false, |b| b.rec);
+                if rec {
                     ctx.output.push_str("let rec ");
                 } else {
                     ctx.output.push_str("let ");
                 }
-                for (i, (name, value)) in bindings.iter().enumerate() {
-                    if i > 0 { ctx.output.push_str("and "); }
-                    ctx.output.push_str(ctx.rodeo.resolve(&name.name));
+                for (i, binding) in bindings.iter().enumerate() {
+                    if i > 0 {
+                        ctx.output.push_str("and ");
+                    }
+                    push_bind_pat(&binding.pat, ctx);
                     ctx.output.push_str(" = ");
                     ctx.indent += 1;
-                    self.visit_expr(value, ctx);
+                    self.visit_expr(&binding.value, ctx);
                     ctx.output.push('\n');
                     ctx.indent -= 1;
                     ctx.output.push_str(&indent(ctx.indent));
@@ -558,7 +632,9 @@ impl<'bump> Visitor<'bump, PrintCtx<'_>> for AstPrinter {
             ExprKind::Tuple(items) => {
                 ctx.output.push('(');
                 for (i, item) in items.iter().enumerate() {
-                    if i > 0 { ctx.output.push_str(", "); }
+                    if i > 0 {
+                        ctx.output.push_str(", ");
+                    }
                     self.visit_expr(item, ctx);
                 }
                 ctx.output.push(')');
@@ -583,11 +659,29 @@ impl<'bump> Visitor<'bump, PrintCtx<'_>> for AstPrinter {
             PatKind::Tuple(pats) => {
                 ctx.output.push('(');
                 for (i, p) in pats.iter().enumerate() {
-                    if i > 0 { ctx.output.push_str(", "); }
+                    if i > 0 {
+                        ctx.output.push_str(", ");
+                    }
                     self.visit_pat(p, ctx);
                 }
                 ctx.output.push(')');
             }
+        }
+    }
+}
+
+fn push_bind_pat(pat: &BindPat, ctx: &mut PrintCtx) {
+    match pat.kind {
+        BindPatKind::Var(ident) => ctx.output.push_str(ctx.rodeo.resolve(&ident.name)),
+        BindPatKind::Tuple(pats) => {
+            ctx.output.push('(');
+            for (i, p) in pats.iter().enumerate() {
+                if i > 0 {
+                    ctx.output.push_str(", ");
+                }
+                push_bind_pat(p, ctx);
+            }
+            ctx.output.push(')');
         }
     }
 }

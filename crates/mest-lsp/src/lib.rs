@@ -8,11 +8,11 @@ use chumsky::{Parser, input::Stream};
 use lasso::Rodeo;
 use logos::Logos;
 use mest_core::{
-    ast::{ExprKind, PatKind},
+    ast::{BindPatKind, ExprKind, PatKind},
     hir::Type,
     parser::parser,
     token::Token,
-    typecheck::{self, rename_type, InferenceTree, Output},
+    typecheck::{self, InferenceTree, Output, rename_type},
 };
 
 use tower_lsp::jsonrpc::Result;
@@ -22,7 +22,11 @@ use tower_lsp::{Client, LanguageServer};
 use mest_core::typecheck::Input as InferInput;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum BindingKind { Let, Param, NotBinding }
+enum BindingKind {
+    Let,
+    Param,
+    NotBinding,
+}
 
 struct AnnotationEntry {
     end: usize,
@@ -112,15 +116,32 @@ fn collect_infer_nodes(tree: &InferenceTree, map: &mut AnnotationMap) {
     if let InferInput::Infer { expr, .. } = &tree.input {
         if let Output::Type(ty) = &tree.output {
             let range: std::ops::Range<usize> = expr.span.into_range();
-            map.spans.insert(range.start, AnnotationEntry { end: range.end, ty: rename_type(ty), kind: BindingKind::NotBinding });
+            map.spans.insert(
+                range.start,
+                AnnotationEntry {
+                    end: range.end,
+                    ty: rename_type(ty),
+                    kind: BindingKind::NotBinding,
+                },
+            );
 
             match &*expr.kind {
                 ExprKind::Let { bindings, .. } => {
-                    for (i, (name, _)) in bindings.iter().enumerate() {
-                        if let Some(child) = tree.children.get(i) {
-                            if let Output::Type(val_ty) = &child.output {
-                                let ident_range: std::ops::Range<usize> = name.span.into_range();
-                                map.spans.insert(ident_range.start, AnnotationEntry { end: ident_range.end, ty: rename_type(val_ty), kind: BindingKind::Let });
+                    for (i, binding) in bindings.iter().enumerate() {
+                        if let BindPatKind::Var(name) = binding.pat.kind {
+                            if let Some(child) = tree.children.get(i) {
+                                if let Output::Type(val_ty) = &child.output {
+                                    let ident_range: std::ops::Range<usize> =
+                                        name.span.into_range();
+                                    map.spans.insert(
+                                        ident_range.start,
+                                        AnnotationEntry {
+                                            end: ident_range.end,
+                                            ty: rename_type(val_ty),
+                                            kind: BindingKind::Let,
+                                        },
+                                    );
+                                }
                             }
                         }
                     }
@@ -131,8 +152,16 @@ fn collect_infer_nodes(tree: &InferenceTree, map: &mut AnnotationMap) {
                             if matches!(*param.kind, PatKind::Var(_)) {
                                 let renamed = rename_type(ty);
                                 if let Type::Arrow(param_ty, _) = &renamed {
-                                    let ident_range: std::ops::Range<usize> = param.span.into_range();
-                                    map.spans.insert(ident_range.start, AnnotationEntry { end: ident_range.end, ty: (**param_ty).clone(), kind: BindingKind::Param });
+                                    let ident_range: std::ops::Range<usize> =
+                                        param.span.into_range();
+                                    map.spans.insert(
+                                        ident_range.start,
+                                        AnnotationEntry {
+                                            end: ident_range.end,
+                                            ty: (**param_ty).clone(),
+                                            kind: BindingKind::Param,
+                                        },
+                                    );
                                 }
                             }
                         }

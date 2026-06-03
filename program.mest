@@ -75,10 +75,26 @@ let result =
 	let b = fib 10 in
 	let c = gcd 48 18 in
 	let d = clamp 0 100 (abs (0 - 42)) in
-	let e = compose factorial sum_to 5 in  
+	let e = compose factorial sum_to 5 in
 	let f = both is_positive is_even 4 in
 	let g = sign (0 - 99) in
 	a + b
 in
 
-result
+
+let rec power base exp =
+	match exp
+	| 0 => 1
+	| n => base * power base (n - 1)
+in
+
+let rec gcd a b =
+	match b
+	| 0 => a
+	| b => gcd b (a - b * (a / b))
+in
+
+let a = gcd 48 18 in
+let b = power 10 5 in
+
+a * b

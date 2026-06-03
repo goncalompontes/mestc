@@ -1,0 +1,1 @@
+let rec a = |x| x and b = a 1 in b

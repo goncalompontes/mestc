@@ -8,7 +8,7 @@ use lasso::Rodeo;
 use thiserror::Error;
 
 use crate::{
-    ast::{BinOp, Expr, ExprKind, Ident, Literal, Pat, PatKind, UnaryOp},
+    ast::{BinOp, BindPat, BindPatKind, Binding, Expr, ExprKind, Ident, Literal, Pat, PatKind, UnaryOp},
     hir::{Type, TypeVar},
 };
 
@@ -135,6 +135,13 @@ fn pat_vars(pat: &Pat) -> BTreeSet<Ident> {
     }
 }
 
+fn bind_pat_idents(pat: &BindPat) -> Vec<Ident> {
+    match pat.kind {
+        BindPatKind::Var(ident) => vec![*ident],
+        BindPatKind::Tuple(pats) => pats.iter().flat_map(|p| bind_pat_idents(p)).collect(),
+    }
+}
+
 fn free_vars(expr: &Expr) -> BTreeSet<Ident> {
     match &**expr {
         ExprKind::Literal(_) => BTreeSet::new(),
@@ -164,11 +171,13 @@ fn free_vars(expr: &Expr) -> BTreeSet<Ident> {
             s1.union(&s2).cloned().collect()
         }
         ExprKind::UnaryOp { rhs, .. } => free_vars(rhs),
-        ExprKind::Let { bindings, body, .. } => {
+        ExprKind::Let { bindings, body } => {
             let mut fv = free_vars(body);
-            for (name, value) in bindings.iter() {
-                fv = fv.union(&free_vars(value)).cloned().collect();
-                fv.remove(name);
+            for binding in bindings.iter() {
+                fv = fv.union(&free_vars(&binding.value)).cloned().collect();
+                for v in bind_pat_idents(&binding.pat) {
+                    fv.remove(&v);
+                }
             }
             fv
         }
@@ -691,11 +700,10 @@ impl<'rodeo> TypeInference<'rodeo> {
             } => self.infer_if(env, expr, cond, then_expr, else_expr),
             ExprKind::BinOp { op, lhs, rhs } => self.infer_binop(env, expr, op, lhs, rhs),
             ExprKind::UnaryOp { op, rhs } => self.infer_unaryop(env, expr, op, rhs),
-            ExprKind::Let {
-                bindings,
-                body,
-                rec,
-            } => self.infer_let(env, expr, bindings, body, *rec),
+            ExprKind::Let { bindings, body } => {
+                let is_rec = bindings.iter().any(|b| b.rec);
+                self.infer_let(env, expr, bindings, body, is_rec)
+            }
             ExprKind::Match { scrutinee, arms } => self.infer_match(env, expr, scrutinee, arms),
             ExprKind::Abs { param, body } => self.infer_abs(env, expr, param, body),
             ExprKind::App { func, arg } => self.infer_app(env, expr, func, arg),
@@ -834,11 +842,43 @@ impl<'rodeo> TypeInference<'rodeo> {
         (subst, tuple_ty, tree)
     }
 
+    fn bind_pat_to_type<'a>(&mut self, pat: &BindPat<'a>) -> (Type, Vec<(Ident, TyVar)>) {
+        match pat.kind {
+            BindPatKind::Var(ident) => {
+                let alpha = self.fresh_tyvar();
+                (Type::Var(alpha), vec![(*ident, alpha)])
+            }
+            BindPatKind::Tuple(pats) => {
+                let mut types = Vec::new();
+                let mut all_vars = Vec::new();
+                for p in pats.iter() {
+                    let (ty, vars) = self.bind_pat_to_type(p);
+                    types.push(ty);
+                    all_vars.extend(vars);
+                }
+                (Type::Tuple(types), all_vars)
+            }
+        }
+    }
+
+    fn bind_pat_type_from_map<'a>(
+        &self,
+        pat: &BindPat<'a>,
+        vars: &HashMap<Ident, TyVar>,
+    ) -> Type {
+        match pat.kind {
+            BindPatKind::Var(ident) => Type::Var(*vars.get(ident).unwrap()),
+            BindPatKind::Tuple(pats) => {
+                Type::Tuple(pats.iter().map(|p| self.bind_pat_type_from_map(p, vars)).collect())
+            }
+        }
+    }
+
     fn infer_let<'a>(
         &mut self,
         env: &Env,
         expr: &'a Expr<'a>,
-        bindings: &'a [(TmVar, Expr<'a>)],
+        bindings: &'a [Binding<'a>],
         body: &'a Expr<'a>,
         rec: bool,
     ) -> (Subst, Type, InferenceTree<'a>) {
@@ -846,40 +886,42 @@ impl<'rodeo> TypeInference<'rodeo> {
 
         let (final_subst, body_ty, children) = if rec {
             let mut rec_env = env.clone();
-            let mut alphas = Vec::new();
-            for (var, _) in bindings.iter() {
-                let alpha = self.fresh_tyvar();
-                rec_env.insert(
-                    var.clone(),
-                    Scheme {
-                        type_vars: vec![],
-                        ty: Type::Var(alpha),
-                    },
-                );
-                alphas.push(alpha);
+            let mut ident_alpha_map: HashMap<Ident, TyVar> = HashMap::new();
+            for binding in bindings.iter() {
+                for ident in bind_pat_idents(&binding.pat) {
+                    let alpha = self.fresh_tyvar();
+                    rec_env.insert(
+                        ident,
+                        Scheme {
+                            type_vars: vec![],
+                            ty: Type::Var(alpha),
+                        },
+                    );
+                    ident_alpha_map.insert(ident, alpha);
+                }
             }
             let mut children: Vec<InferenceTree<'a>> = Vec::new();
             let mut combined_s = Subst::empty();
-            let mut value_tys = Vec::new();
 
-            for ((var, value), alpha) in bindings.iter().zip(alphas.iter()) {
+            for binding in bindings.iter() {
                 let rec_env_applied = Self::apply_env(&combined_s, &rec_env);
-                let (s1, value_ty, tree1) = self.infer(&rec_env_applied, value);
+                let (s1, value_ty, tree1) = self.infer(&rec_env_applied, &binding.value);
                 combined_s = s1.compose(&combined_s);
-                let alpha_ty = Self::apply_type(&combined_s, &Type::Var(*alpha));
-                let value_ty_s = Self::apply_type(&combined_s, &value_ty);
-                let (s_unify, unify_tree) = self.unify(&alpha_ty, &value_ty_s, expr.span);
-                combined_s = s_unify.compose(&combined_s);
                 children.push(tree1);
+
+                let value_ty_s = Self::apply_type(&combined_s, &value_ty);
+                let expected_ty = self.bind_pat_type_from_map(&binding.pat, &ident_alpha_map);
+                let (s_unify, unify_tree) = self.unify(&value_ty_s, &expected_ty, binding.pat.span);
+                combined_s = s_unify.compose(&combined_s);
                 children.push(unify_tree);
-                value_tys.push((*var, Self::apply_type(&combined_s, &value_ty)));
             }
 
             let env_subst = Self::apply_env(&combined_s, env);
             let mut new_env = env_subst;
-            for (var, final_value_ty) in value_tys {
-                let scheme = self.generalize(&new_env, &final_value_ty);
-                new_env.insert(var.clone(), scheme);
+            for (ident, alpha) in &ident_alpha_map {
+                let alpha_ty = Self::apply_type(&combined_s, &Type::Var(*alpha));
+                let scheme = self.generalize(&new_env, &alpha_ty);
+                new_env.insert(*ident, scheme);
             }
 
             let (s2, body_ty, tree2) = self.infer(&new_env, body);
@@ -889,12 +931,26 @@ impl<'rodeo> TypeInference<'rodeo> {
         } else {
             let mut children: Vec<InferenceTree<'a>> = Vec::new();
             let mut env_subst = env.clone();
-            for (var, value) in bindings.iter() {
-                let (s1, value_ty, tree1) = self.infer(&env_subst, value);
+            for binding in bindings.iter() {
+                let (expected_ty, fresh_vars) = self.bind_pat_to_type(&binding.pat);
+                let (s1, value_ty, tree1) = self.infer(&env_subst, &binding.value);
                 children.push(tree1);
                 env_subst = Self::apply_env(&s1, &env_subst);
-                let generalized_ty = self.generalize(&env_subst, &value_ty);
-                env_subst.insert(var.clone(), generalized_ty);
+
+                if fresh_vars.len() == 1 {
+                    let generalized_ty = self.generalize(&env_subst, &value_ty);
+                    env_subst.insert(fresh_vars[0].0, generalized_ty);
+                } else {
+                    let (s_unify, unify_tree) =
+                        self.unify(&value_ty, &expected_ty, binding.pat.span);
+                    children.push(unify_tree);
+                    env_subst = Self::apply_env(&s_unify, &env_subst);
+                    for (ident, alpha) in &fresh_vars {
+                        let alpha_ty = Self::apply_type(&s_unify, &Type::Var(*alpha));
+                        let generalized_ty = self.generalize(&env_subst, &alpha_ty);
+                        env_subst.insert(*ident, generalized_ty);
+                    }
+                }
             }
             let (s2, body_ty, tree2) = self.infer(&env_subst, body);
             children.push(tree2);

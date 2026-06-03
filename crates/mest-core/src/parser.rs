@@ -13,7 +13,7 @@ use chumsky::{
 use lasso::Rodeo;
 
 use crate::{
-    ast::{BinOp, ExprKind, Expr, Ident, Literal, Pat, PatKind, UnaryOp},
+    ast::{BinOp, BindPat, Binding, Expr, ExprKind, Ident, Literal, Pat, PatKind, UnaryOp},
     token::Token,
 };
 
@@ -49,12 +49,12 @@ where
     'bump: 'tok,
 {
     select! { Token::Ident(name) => name }
-        .map_with(|name, e: &mut MapExtra<'_, '_, I, Extra<'tok, 'src>>| {
-            Ident {
+        .map_with(
+            |name, e: &mut MapExtra<'_, '_, I, Extra<'tok, 'src>>| Ident {
                 name: e.state().get_or_intern(name),
                 span: e.span(),
-            }
-        })
+            },
+        )
         .boxed()
 }
 
@@ -82,13 +82,12 @@ where
     'bump: 'tok,
 {
     recursive(|pat| {
-        let pat = pat.boxed();
-
-        let wildcard = just(Token::Ident("_"))
-            .map_with(|_, e: &mut MapExtra<'_, '_, I, Extra<'tok, 'src>>| Pat {
+        let wildcard = just(Token::Ident("_")).map_with(
+            |_, e: &mut MapExtra<'_, '_, I, Extra<'tok, 'src>>| Pat {
                 kind: bump.alloc(PatKind::Wildcard),
                 span: e.span(),
-            });
+            },
+        );
 
         let pat_lit = select! {
             Token::Int(n)   => Literal::Int(n),
@@ -101,8 +100,8 @@ where
             span: e.span(),
         });
 
-        let pat_var = ident_parser()
-            .map_with(|name, e: &mut MapExtra<'_, '_, I, Extra<'tok, 'src>>| Pat {
+        let pat_var =
+            ident_parser().map_with(|name, e: &mut MapExtra<'_, '_, I, Extra<'tok, 'src>>| Pat {
                 kind: bump.alloc(PatKind::Var(name)),
                 span: e.span(),
             });
@@ -112,27 +111,54 @@ where
                 pat.clone()
                     .then_ignore(just(Token::Comma))
                     .then_ignore(just(Token::RParen))
-                    .map(|p| {
-                        vec![p]
-                    })
-                    .or(
-                        pat.clone()
-                            .separated_by(just(Token::Comma))
-                            .at_least(2)
-                            .collect::<Vec<_>>()
-                            .then_ignore(just(Token::RParen)),
-                    ),
+                    .map(|p| vec![p])
+                    .or(pat
+                        .clone()
+                        .separated_by(just(Token::Comma))
+                        .at_least(2)
+                        .collect::<Vec<_>>()
+                        .then_ignore(just(Token::RParen))),
             )
             .map_with(|pats, e| Pat {
                 kind: bump.alloc(PatKind::Tuple(bump.alloc_slice_fill_iter(pats))),
                 span: e.span(),
             });
 
-        wildcard
-            .or(pat_lit)
-            .or(pat_var)
-            .or(tuple_pat)
-            .boxed()
+        wildcard.or(pat_lit).or(pat_var).or(tuple_pat)
+    })
+    .boxed()
+}
+
+fn bind_pat_parser<'tok, 'src, 'bump, I>(
+    bump: &'bump Bump,
+) -> BoxedParser<'tok, 'src, 'bump, I, BindPat<'bump>>
+where
+    I: ValueInput<'tok, Token = Token<'src>, Span = SimpleSpan>,
+    'src: 'tok,
+    'bump: 'tok,
+{
+    recursive(|pat| {
+        let pat_var =
+            ident_parser().map_with(|name, e: &mut MapExtra<'_, '_, I, Extra<'tok, 'src>>| {
+                BindPat::var(bump, name, e.span())
+            });
+
+        let tuple_pat = just(Token::LParen)
+            .ignore_then(
+                pat.clone()
+                    .then_ignore(just(Token::Comma))
+                    .then_ignore(just(Token::RParen))
+                    .map(|p| vec![p])
+                    .or(pat
+                        .clone()
+                        .separated_by(just(Token::Comma))
+                        .at_least(2)
+                        .collect::<Vec<_>>()
+                        .then_ignore(just(Token::RParen))),
+            )
+            .map_with(|pats, e| BindPat::tuple(bump, pats.into_iter(), e.span()));
+
+        pat_var.or(tuple_pat)
     })
     .boxed()
 }
@@ -326,28 +352,37 @@ where
     'src: 'tok,
     'bump: 'tok,
 {
-    let single_binding = ident_parser()
-        .then(ident_parser().repeated().collect::<Vec<_>>())
+    // this is just a binding: <rec>? <pattern> (<and> <pattern>)* = <expr>
+    let binding = just(Token::Rec)
+        .or_not()
+        .then(bind_pat_parser(bump))
+        .then(pat_parser(bump).repeated().collect::<Vec<_>>())
         .then_ignore(just(Token::Eq))
         .then(expr.clone())
-        .map_with(|((name, params), value), _| {
+        .map_with(|(((rec, name), params), value), _| {
             let value = params.into_iter().rev().fold(value, |body, param| {
-                let param_pat = Pat { kind: bump.alloc(PatKind::Var(param)), span: param.span };
-                ExprKind::lambda(bump, param_pat.span, param_pat, body)
+                ExprKind::lambda(bump, param.span, param, body)
             });
-            (name, value)
+            Binding::new(bump, rec.is_some(), name, value)
         });
 
+    // this is: <let> <binding> ( <and> <binding> )* <in>
     just(Token::Let)
-        .then(just(Token::Rec).or_not())
-        .then(single_binding.clone())
-        .then(just(Token::And).ignore_then(single_binding).repeated().collect::<Vec<_>>())
+        .ignore_then(binding.clone())
+        .then(
+            just(Token::And)
+                .ignore_then(binding)
+                .repeated()
+                .collect::<Vec<_>>(),
+        )
         .then_ignore(just(Token::In))
         .then(expr)
-        .map_with(|((((_, rec), first_binding), extra_bindings), body), e| {
-            let mut all_bindings = vec![first_binding];
-            all_bindings.extend(extra_bindings);
-            ExprKind::let_expr(bump, e.span(), bump.alloc_slice_fill_iter(all_bindings), body, rec.is_some())
+        .map_with(|((first_binding, mut extra_bindings), body), e| {
+            let bindings = bump.alloc_slice_fill_iter({
+                extra_bindings.insert(0, first_binding);
+                extra_bindings
+            }) as &_;
+            ExprKind::let_expr(bump, e.span(), bindings, body)
         })
         .boxed()
 }

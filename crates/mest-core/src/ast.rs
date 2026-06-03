@@ -104,6 +104,51 @@ impl<'bump> Deref for Expr<'bump> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct BindPat<'bump> {
+    pub kind: &'bump BindPatKind<'bump>,
+    pub span: SimpleSpan,
+}
+
+#[derive(Debug, Clone)]
+pub enum BindPatKind<'bump> {
+    Var(Ident),
+    Tuple(&'bump [BindPat<'bump>]),
+}
+
+#[derive(Debug, Clone)]
+pub struct Binding<'bump> {
+    pub rec: bool,
+    pub pat: BindPat<'bump>,
+    pub value: Expr<'bump>,
+}
+
+impl<'bump> BindPat<'bump> {
+    pub fn var(bump: &'bump Bump, ident: Ident, span: SimpleSpan) -> Self {
+        Self {
+            kind: bump.alloc(BindPatKind::Var(ident)),
+            span,
+        }
+    }
+
+    pub fn tuple(
+        bump: &'bump Bump,
+        pats: impl ExactSizeIterator<Item = BindPat<'bump>>,
+        span: SimpleSpan,
+    ) -> Self {
+        Self {
+            kind: bump.alloc(BindPatKind::Tuple(bump.alloc_slice_fill_iter(pats))),
+            span,
+        }
+    }
+}
+
+impl<'bump> Binding<'bump> {
+    pub fn new(_bump: &'bump Bump, rec: bool, pat: BindPat<'bump>, value: Expr<'bump>) -> Self {
+        Self { rec, pat, value }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ExprKind<'bump> {
     Literal(Literal),
@@ -123,9 +168,8 @@ pub enum ExprKind<'bump> {
         rhs: Expr<'bump>,
     },
     Let {
-        bindings: &'bump [(Ident, Expr<'bump>)],
+        bindings: &'bump [Binding<'bump>],
         body: Expr<'bump>,
-        rec: bool,
     },
     Match {
         scrutinee: Expr<'bump>,
@@ -167,7 +211,9 @@ impl std::fmt::Display for Value<'_> {
             Value::Tuple(items) => {
                 write!(f, "(")?;
                 for (i, item) in items.iter().enumerate() {
-                    if i > 0 { write!(f, ", ")?; }
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
                     write!(f, "{item}")?;
                 }
                 write!(f, ")")
@@ -264,18 +310,10 @@ impl<'bump> ExprKind<'bump> {
     pub fn let_expr(
         bump: &'bump Bump,
         span: SimpleSpan,
-        bindings: &'bump [(Ident, Expr<'bump>)],
+        bindings: &'bump [Binding<'bump>],
         body: Expr<'bump>,
-        rec: bool,
     ) -> Expr<'bump> {
-        Self::node(
-            bump.alloc(ExprKind::Let {
-                bindings,
-                body,
-                rec,
-            }),
-            span,
-        )
+        Self::node(bump.alloc(ExprKind::Let { bindings, body }), span)
     }
 
     pub fn match_expr(
@@ -363,6 +401,7 @@ impl<'bump> ExprKind<'bump> {
                 Self::eval_binop(op, lhs, rhs)
             }
 
+            /*
             ExprKind::Let {
                 bindings,
                 body,
@@ -392,6 +431,40 @@ impl<'bump> ExprKind<'bump> {
                     env.insert(*name, Self::thunk(value.kind, &env));
                 }
                 body.kind.eval_lazy(&env, rodeo)
+            }
+            */
+            ExprKind::Let { bindings, body } => {
+                if bindings.iter().any(|b| b.rec) {
+                    let rec_env = Rc::new(RefCell::new(env.clone()));
+                    for binding in bindings.iter() {
+                        if let BindPatKind::Var(ident) = binding.pat.kind {
+                            let thunk = Thunk::new_shared(binding.value.kind, Rc::clone(&rec_env));
+                            rec_env.borrow_mut().insert(*ident, thunk);
+                        }
+                    }
+                    let mut body_env = env.clone();
+                    for binding in bindings.iter() {
+                        match binding.pat.kind {
+                            BindPatKind::Var(ident) => {
+                                let thunk = rec_env.borrow().get(ident).unwrap().clone();
+                                body_env.insert(*ident, thunk);
+                            }
+                            BindPatKind::Tuple(_) => {
+                                let thunk =
+                                    Thunk::new_shared(binding.value.kind, Rc::clone(&rec_env));
+                                Self::bind_pat_to_env(&binding.pat, &thunk, &mut body_env, rodeo)?;
+                            }
+                        }
+                    }
+                    body.kind.eval_lazy(&body_env, rodeo)
+                } else {
+                    let mut body_env = env.clone();
+                    for binding in bindings.iter() {
+                        let thunk = Self::thunk(binding.value.kind, &body_env);
+                        Self::bind_pat_to_env(&binding.pat, &thunk, &mut body_env, rodeo)?;
+                    }
+                    body.kind.eval_lazy(&body_env, rodeo)
+                }
             }
 
             ExprKind::Match { scrutinee, arms } => {
@@ -498,6 +571,43 @@ impl<'bump> ExprKind<'bump> {
                         Ok(true)
                     }
                     _ => Ok(false),
+                }
+            }
+        }
+    }
+
+    fn bind_pat_to_env(
+        pat: &BindPat<'bump>,
+        thunk: &Thunk<'bump>,
+        env: &mut Env<'bump>,
+        rodeo: &Rodeo,
+    ) -> Result<(), EvalError> {
+        match pat.kind {
+            BindPatKind::Var(ident) => {
+                env.insert(*ident, thunk.clone());
+                Ok(())
+            }
+            BindPatKind::Tuple(pats) => {
+                let val = thunk.force(rodeo)?;
+                match val {
+                    Value::Tuple(ref items) => {
+                        if pats.len() != items.len() {
+                            return Err(EvalError::TypeMismatch {
+                                expected: "tuple",
+                                got: type_name(&val),
+                            });
+                        }
+                        for (sub_pat, item_val) in pats.iter().zip(items.iter()) {
+                            let item_env = thunk.env_cell().borrow().clone();
+                            let item_thunk = Thunk::from_value(item_val.clone(), item_env);
+                            Self::bind_pat_to_env(sub_pat, &item_thunk, env, rodeo)?;
+                        }
+                        Ok(())
+                    }
+                    _ => Err(EvalError::TypeMismatch {
+                        expected: "tuple",
+                        got: type_name(&val),
+                    }),
                 }
             }
         }
