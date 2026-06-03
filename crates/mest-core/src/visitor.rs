@@ -55,6 +55,12 @@ pub trait Visitor<'bump, Ctx>: Sized {
                     self.walk_expr(item, ctx);
                 }
             }
+            ExprKind::Type { body, .. } => self.walk_expr(body, ctx),
+            ExprKind::Constructor { arg, .. } => {
+                if let Some(arg) = arg {
+                    self.walk_expr(arg, ctx);
+                }
+            }
         }
     }
 
@@ -69,6 +75,11 @@ pub trait Visitor<'bump, Ctx>: Sized {
             PatKind::Tuple(pats) => {
                 for p in pats.iter() {
                     self.walk_pat(p, ctx);
+                }
+            }
+            PatKind::Constructor { arg, .. } => {
+                if let Some(arg) = arg {
+                    self.walk_pat(arg, ctx);
                 }
             }
         }
@@ -301,6 +312,18 @@ fn write_inline(f: &mut std::fmt::Formatter, kind: &ExprKind, rodeo: &Rodeo) -> 
             }
             write!(f, ")")
         }
+        ExprKind::Type { body, .. } => {
+            write!(f, "[type ...] ")?;
+            write_inline(f, &**body, rodeo)
+        }
+        ExprKind::Constructor { name, arg } => {
+            write!(f, "{}", rodeo.resolve(&name.name))?;
+            if let Some(arg) = arg {
+                write!(f, " ")?;
+                write_inline(f, &**arg, rodeo)?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -359,6 +382,15 @@ fn pat_write_inline(pat: &Pat, rodeo: &Rodeo, f: &mut std::fmt::Formatter) -> st
                 pat_write_inline(p, rodeo, f)?;
             }
             write!(f, ")")
+        }
+        PatKind::Constructor { name, arg } => {
+            write!(f, "{}", rodeo.resolve(&name.name))?;
+            if let Some(arg) = arg {
+                write!(f, " (")?;
+                pat_write_inline(arg, rodeo, f)?;
+                write!(f, ")")?;
+            }
+            Ok(())
         }
     }
 }
@@ -464,6 +496,18 @@ fn write_minimized(
             }
             write!(f, ")")
         }
+        ExprKind::Type { body, .. } => {
+            write!(f, "[type ...] ")?;
+            write_minimized(f, &**body, rodeo)
+        }
+        ExprKind::Constructor { name, arg } => {
+            write!(f, "{}", rodeo.resolve(&name.name))?;
+            if let Some(arg) = arg {
+                write!(f, " ")?;
+                write_minimized(f, &**arg, rodeo)?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -486,6 +530,8 @@ fn needs_parens_simple(expr: &Expr) -> bool {
             | ExprKind::Match { .. }
             | ExprKind::BinOp { .. }
             | ExprKind::UnaryOp { .. }
+            | ExprKind::Type { .. }
+            | ExprKind::Constructor { .. }
     )
 }
 
@@ -639,6 +685,18 @@ impl<'bump> Visitor<'bump, PrintCtx<'_>> for AstPrinter {
                 }
                 ctx.output.push(')');
             }
+            ExprKind::Type { body, .. } => {
+                ctx.output.push_str("type ... in\n");
+                ctx.output.push_str(&indent(ctx.indent + 1));
+                self.visit_expr(body, ctx);
+            }
+            ExprKind::Constructor { name, arg } => {
+                ctx.output.push_str(ctx.rodeo.resolve(&name.name));
+                if let Some(arg) = arg {
+                    ctx.output.push(' ');
+                    self.visit_expr(arg, ctx);
+                }
+            }
         }
     }
 
@@ -665,6 +723,13 @@ impl<'bump> Visitor<'bump, PrintCtx<'_>> for AstPrinter {
                     self.visit_pat(p, ctx);
                 }
                 ctx.output.push(')');
+            }
+            PatKind::Constructor { name, arg } => {
+                ctx.output.push_str(ctx.rodeo.resolve(&name.name));
+                if let Some(arg) = arg {
+                    ctx.output.push(' ');
+                    self.visit_pat(arg, ctx);
+                }
             }
         }
     }

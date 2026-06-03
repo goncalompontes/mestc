@@ -9,7 +9,13 @@ use crate::ast::{BinOp, Ident, Literal, UnaryOp};
 #[derive(Debug, Clone, Copy, From, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TypeVar(pub u64);
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RecordField {
+    pub name: Spur,
+    pub ty: Type,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Type {
     Var(TypeVar),
     Arrow(Box<Type>, Box<Type>),
@@ -17,8 +23,18 @@ pub enum Type {
     Float,
     Bool,
     Tuple(Vec<Type>),
+    App(Spur, Vec<Type>),
+    Record(Vec<RecordField>),
     Error,
     Never,
+}
+
+use lasso::Spur;
+
+impl Type {
+    pub fn app(name: Spur, args: Vec<Type>) -> Self {
+        Type::App(name, args)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -76,8 +92,8 @@ pub enum TPat<'bump> {
 }
 
 const GREEK_LETTERS: &[&str] = &[
-    "α", "β", "γ", "δ", "ε", "ζ", "η", "θ", "ι", "κ", "λ", "μ", "ν", "ξ", "ο", "π", "ρ", "σ", "τ",
-    "υ", "φ", "χ", "ψ", "ω",
+    "τ", "υ", "ν", "ο", "α", "β", "γ", "δ", "ζ", "η", "θ", "ι", "κ", "ξ", "ρ", "χ", "ψ",
+    "ε", "λ", "μ", "π", "σ", "φ", "ω",
 ];
 
 impl fmt::Display for TypeVar {
@@ -89,6 +105,17 @@ impl fmt::Display for TypeVar {
     }
 }
 
+fn write_record_fields(f: &mut fmt::Formatter<'_>, fields: &[RecordField]) -> fmt::Result {
+    write!(f, "{{ ")?;
+    for (i, field) in fields.iter().enumerate() {
+        if i > 0 {
+            write!(f, ", ")?;
+        }
+        write!(f, "{:?}: {}", field.name, field.ty)?;
+    }
+    write!(f, " }}")
+}
+
 impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -98,6 +125,14 @@ impl fmt::Display for Type {
             Type::Float => write!(f, "Float"),
             Type::Bool => write!(f, "Bool"),
             Type::Tuple(items) => write!(f, "({})", items.iter().format(",")),
+            Type::App(name, args) => {
+                if args.is_empty() {
+                    write!(f, "{:?}", name)
+                } else {
+                    write!(f, "{:?} {}", name, args.iter().format(" "))
+                }
+            }
+            Type::Record(fields) => write_record_fields(f, fields),
             Type::Error => write!(f, "<error>"),
             Type::Never => write!(f, "Never"),
         }

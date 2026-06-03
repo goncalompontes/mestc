@@ -1,9 +1,52 @@
 use bumpalo::Bump;
 use chumsky::span::SimpleSpan;
 use lasso::{Rodeo, Spur};
-use std::{cell::RefCell, hash::Hash, ops::Deref, rc::Rc};
+use std::{cell::RefCell, fmt, hash::Hash, ops::Deref, rc::Rc};
 
 use crate::thunk::Thunk;
+
+#[derive(Debug, Clone)]
+pub struct VariantDef<'bump> {
+    pub name: Ident,
+    pub arg: Option<TypeExpr<'bump>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TypeDef<'bump> {
+    pub name: Ident,
+    pub params: &'bump [Ident],
+    pub variants: &'bump [VariantDef<'bump>],
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TypeExpr<'bump> {
+    pub kind: &'bump TypeExprKind<'bump>,
+    pub span: SimpleSpan,
+}
+
+impl<'bump> Deref for TypeExpr<'bump> {
+    type Target = TypeExprKind<'bump>;
+    fn deref(&self) -> &Self::Target {
+        self.kind
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum TypeExprKind<'bump> {
+    /// Built-in type: Int, Float, Bool
+    Builtin(&'static str),
+    /// Type variable (lowercase ident)
+    Var(Ident),
+    /// Named type constructor (uppercase ident, including user-defined)
+    Named(Ident),
+    /// Tuple type (T1, T2, ...)
+    Tuple(&'bump [TypeExpr<'bump>]),
+    /// Function arrow A -> B
+    Arrow {
+        from: &'bump TypeExpr<'bump>,
+        to: &'bump TypeExpr<'bump>,
+    },
+}
 
 #[derive(Debug, Clone)]
 pub enum Literal {
@@ -88,6 +131,10 @@ pub enum PatKind<'bump> {
     Lit(Literal),
     Or(&'bump Pat<'bump>, &'bump Pat<'bump>),
     Tuple(&'bump [Pat<'bump>]),
+    Constructor {
+        name: Ident,
+        arg: Option<&'bump Pat<'bump>>,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -184,6 +231,14 @@ pub enum ExprKind<'bump> {
         arg: Expr<'bump>,
     },
     Tuple(&'bump [Expr<'bump>]),
+    Type {
+        definitions: &'bump [TypeDef<'bump>],
+        body: Expr<'bump>,
+    },
+    Constructor {
+        name: Ident,
+        arg: Option<Expr<'bump>>,
+    },
 }
 
 pub type Env<'bump> = im::HashMap<Ident, Thunk<'bump>>;
@@ -199,10 +254,27 @@ pub enum Value<'bump> {
         env: Env<'bump>,
     },
     Tuple(Vec<Value<'bump>>),
+    Constructor {
+        name: Spur,
+        arg: Option<Box<Value<'bump>>>,
+    },
 }
 
-impl std::fmt::Display for Value<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Value<'_> {
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Value::Int(_) => "Int",
+            Value::Float(_) => "Float",
+            Value::Bool(_) => "Bool",
+            Value::Closure { .. } => "closure",
+            Value::Tuple(_) => "tuple",
+            Value::Constructor { .. } => "constructor",
+        }
+    }
+}
+
+impl fmt::Display for Value<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Value::Int(n) => write!(f, "{n}"),
             Value::Float(n) => write!(f, "{n}"),
@@ -217,6 +289,13 @@ impl std::fmt::Display for Value<'_> {
                     write!(f, "{item}")?;
                 }
                 write!(f, ")")
+            }
+            Value::Constructor { name, arg } => {
+                write!(f, "{:?}", name)?;
+                if let Some(arg) = arg {
+                    write!(f, " {}", arg)?;
+                }
+                Ok(())
             }
         }
     }
@@ -245,16 +324,6 @@ impl std::fmt::Display for EvalError {
             EvalError::DivisionByZero => write!(f, "division by zero"),
             EvalError::NotAFunction => write!(f, "applied a non-function value"),
         }
-    }
-}
-
-fn type_name(v: &Value) -> &'static str {
-    match v {
-        Value::Int(_) => "int",
-        Value::Float(_) => "float",
-        Value::Bool(_) => "bool",
-        Value::Closure { .. } => "closure",
-        Value::Tuple(_) => "tuple",
     }
 }
 
@@ -386,11 +455,11 @@ impl<'bump> ExprKind<'bump> {
                     (UnaryOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
                     (UnaryOp::Neg, v) => Err(EvalError::TypeMismatch {
                         expected: "number",
-                        got: type_name(&v),
+                        got: v.type_name(),
                     }),
                     (UnaryOp::Not, v) => Err(EvalError::TypeMismatch {
                         expected: "bool",
-                        got: type_name(&v),
+                        got: v.type_name(),
                     }),
                 }
             }
@@ -487,7 +556,7 @@ impl<'bump> ExprKind<'bump> {
                 Value::Bool(false) => else_expr.kind.eval_lazy(env, rodeo),
                 v => Err(EvalError::TypeMismatch {
                     expected: "bool",
-                    got: type_name(&v),
+                    got: v.type_name(),
                 }),
             },
 
@@ -519,6 +588,23 @@ impl<'bump> ExprKind<'bump> {
                     values.push(item.kind.eval_lazy(env, rodeo)?);
                 }
                 Ok(Value::Tuple(values))
+            }
+
+            ExprKind::Constructor { name, arg } => {
+                let arg = match arg {
+                    Some(arg) => Some(Box::new(arg.kind.eval_lazy(env, rodeo)?)),
+                    None => None,
+                };
+                Ok(Value::Constructor {
+                    name: name.name,
+                    arg,
+                })
+            }
+
+            ExprKind::Type { definitions: _, body } => {
+                // Type definitions are handled during typechecking.
+                // At runtime, constructors are just data; no special setup needed.
+                body.kind.eval_lazy(env, rodeo)
             }
         }
     }
@@ -573,6 +659,24 @@ impl<'bump> ExprKind<'bump> {
                     _ => Ok(false),
                 }
             }
+            PatKind::Constructor { name, arg } => {
+                let val = thunk.force(rodeo)?;
+                match val {
+                    Value::Constructor {
+                        name: ref val_name,
+                        arg: ref val_arg,
+                    } if *val_name == name.name => match (arg, val_arg) {
+                        (None, _) => Ok(true),
+                        (Some(pat), Some(data)) => {
+                            let data_val = (**data).clone();
+                            let data_thunk = Thunk::from_value(data_val, env.clone());
+                            Self::match_pat(pat, &data_thunk, env, rodeo)
+                        }
+                        _ => Ok(false),
+                    },
+                    _ => Ok(false),
+                }
+            }
         }
     }
 
@@ -594,7 +698,7 @@ impl<'bump> ExprKind<'bump> {
                         if pats.len() != items.len() {
                             return Err(EvalError::TypeMismatch {
                                 expected: "tuple",
-                                got: type_name(&val),
+                                got: val.type_name(),
                             });
                         }
                         for (sub_pat, item_val) in pats.iter().zip(items.iter()) {
@@ -606,7 +710,7 @@ impl<'bump> ExprKind<'bump> {
                     }
                     _ => Err(EvalError::TypeMismatch {
                         expected: "tuple",
-                        got: type_name(&val),
+                        got: val.type_name(),
                     }),
                 }
             }
@@ -624,7 +728,7 @@ impl<'bump> ExprKind<'bump> {
             (BinOp::And, _, _) | (BinOp::Or, _, _) => {
                 return Err(EvalError::TypeMismatch {
                     expected: "bool",
-                    got: type_name(&lhs),
+                    got: lhs.type_name(),
                 });
             }
             _ => {}
@@ -643,7 +747,7 @@ impl<'bump> ExprKind<'bump> {
             (Value::Float(l), Value::Int(r)) => Self::eval_float_binop(op, l, r as f64),
             (lhs, _) => Err(EvalError::TypeMismatch {
                 expected: "number",
-                got: type_name(&lhs),
+                got: lhs.type_name(),
             }),
         }
     }
@@ -656,8 +760,8 @@ impl<'bump> ExprKind<'bump> {
             (Value::Int(l), Value::Float(r)) => Ok((*l as f64) == *r),
             (Value::Float(l), Value::Int(r)) => Ok(*l == (*r as f64)),
             (l, r) => Err(EvalError::TypeMismatch {
-                expected: type_name(l),
-                got: type_name(r),
+                expected: l.type_name(),
+                got: r.type_name(),
             }),
         }
     }
@@ -708,5 +812,466 @@ impl<'bump> ExprKind<'bump> {
             BinOp::Pow => lhs.powf(rhs),
             _ => unreachable!(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bumpalo::Bump;
+    use chumsky::span::Span;
+    use lasso::Rodeo;
+
+    fn make_ident(rodeo: &mut Rodeo, name: &str) -> Ident {
+        let spur = rodeo.get_or_intern(name);
+        Ident {
+            name: spur,
+            span: SimpleSpan::new((), 0..0),
+        }
+    }
+
+    fn lit_int(bump: &Bump, n: i64) -> Expr<'_> {
+        ExprKind::literal(bump, SimpleSpan::new((), 0..0), Literal::Int(n))
+    }
+
+    fn span() -> SimpleSpan {
+        SimpleSpan::new((), 0..0)
+    }
+
+    fn eval<'bump>(expr: &Expr<'bump>) -> Result<Value<'bump>, EvalError> {
+        let rodeo = Rodeo::default();
+        let env = Env::default();
+        expr.kind.eval_lazy(&env, &rodeo)
+    }
+
+    // ── Value::Constructor display and type_name ──────────────────────
+
+    #[test]
+    fn test_constructor_display_no_arg() {
+        let mut rodeo = Rodeo::default();
+        let name = rodeo.get_or_intern("None");
+        let val = Value::Constructor { name, arg: None };
+        let s = format!("{val}");
+        assert_eq!(s, format!("{:?}", name));
+    }
+
+    #[test]
+    fn test_constructor_display_with_arg() {
+        let mut rodeo = Rodeo::default();
+        let name = rodeo.get_or_intern("Some");
+        let val = Value::Constructor {
+            name,
+            arg: Some(Box::new(Value::Int(42))),
+        };
+        let s = format!("{val}");
+        assert_eq!(s, format!("{:?} 42", name));
+    }
+
+    #[test]
+    fn test_constructor_type_name() {
+        let mut rodeo = Rodeo::default();
+        let name = rodeo.get_or_intern("None");
+        let val = Value::Constructor { name, arg: None };
+        assert_eq!(val.type_name(), "constructor");
+    }
+
+    // ── Constructor expression evaluation ────────────────────────────
+
+    #[test]
+    fn test_constructor_expr_no_arg() {
+        let bump = Bump::new();
+        let mut rodeo = Rodeo::default();
+        let ident = make_ident(&mut rodeo, "None");
+        let expr = ExprKind::node(
+            bump.alloc(ExprKind::Constructor {
+                name: ident,
+                arg: None,
+            }),
+            span(),
+        );
+        let val = eval(&expr).unwrap();
+        assert_eq!(val.type_name(), "constructor");
+        match val {
+            Value::Constructor { name, arg: None } => {
+                assert_eq!(name, ident.name);
+            }
+            _ => panic!("expected Constructor"),
+        }
+    }
+
+    #[test]
+    fn test_constructor_expr_with_arg() {
+        let bump = Bump::new();
+        let mut rodeo = Rodeo::default();
+        let ident = make_ident(&mut rodeo, "Some");
+        let arg = Box::new(ExprKind::node(
+            bump.alloc(ExprKind::Constructor {
+                name: ident,
+                arg: None,
+            }),
+            span(),
+        ));
+        let outer_ident = make_ident(&mut rodeo, "Outer");
+        let expr = ExprKind::node(
+            bump.alloc(ExprKind::Constructor {
+                name: outer_ident,
+                arg: Some(*arg),
+            }),
+            span(),
+        );
+        let val = eval(&expr).unwrap();
+        match val {
+            Value::Constructor {
+                name,
+                arg: Some(inner),
+            } => {
+                assert_eq!(name, outer_ident.name);
+                match *inner {
+                    Value::Constructor { arg: None, .. } => {}
+                    _ => panic!("expected nested Constructor"),
+                }
+            }
+            _ => panic!("expected outermost Constructor"),
+        }
+    }
+
+    // ── Pattern matching with constructors ───────────────────────────
+
+    #[test]
+    fn test_match_constructor_no_arg() {
+        let bump = Bump::new();
+        let mut rodeo = Rodeo::default();
+        let none_ident = make_ident(&mut rodeo, "None");
+
+        let scrutinee = ExprKind::node(
+            bump.alloc(ExprKind::Constructor {
+                name: none_ident,
+                arg: None,
+            }),
+            span(),
+        );
+
+        let pat = Pat {
+            kind: bump.alloc(PatKind::Constructor {
+                name: none_ident,
+                arg: None,
+            }),
+            span: span(),
+        };
+        let body = lit_int(&bump, 1);
+        let fallback_pat = Pat {
+            kind: bump.alloc(PatKind::Wildcard),
+            span: span(),
+        };
+        let fallback_body = lit_int(&bump, 0);
+        let arms: &[(Pat, Expr)] = bump.alloc_slice_fill_iter([(pat, body), (fallback_pat, fallback_body)]);
+
+        let match_expr = ExprKind::node(
+            bump.alloc(ExprKind::Match { scrutinee, arms }),
+            span(),
+        );
+
+        let val = eval(&match_expr).unwrap();
+        assert!(matches!(val, Value::Int(1)));
+    }
+
+    #[test]
+    fn test_match_constructor_with_arg() {
+        let bump = Bump::new();
+        let mut rodeo = Rodeo::default();
+        let some_ident = make_ident(&mut rodeo, "Some");
+        let x_ident = make_ident(&mut rodeo, "x");
+
+        let scrutinee = ExprKind::node(
+            bump.alloc(ExprKind::Constructor {
+                name: some_ident,
+                arg: Some(lit_int(&bump, 42)),
+            }),
+            span(),
+        );
+
+        let var_pat = Pat {
+            kind: bump.alloc(PatKind::Var(x_ident)),
+            span: span(),
+        };
+        let pat = Pat {
+            kind: bump.alloc(PatKind::Constructor {
+                name: some_ident,
+                arg: Some(&*bump.alloc(var_pat)),
+            }),
+            span: span(),
+        };
+        let body = ExprKind::node(
+            bump.alloc(ExprKind::Var(x_ident)),
+            span(),
+        );
+        let fallback_pat = Pat {
+            kind: bump.alloc(PatKind::Wildcard),
+            span: span(),
+        };
+        let fallback_body = lit_int(&bump, 0);
+        let arms: &[(Pat, Expr)] = bump.alloc_slice_fill_iter([(pat, body), (fallback_pat, fallback_body)]);
+
+        let match_expr = ExprKind::node(
+            bump.alloc(ExprKind::Match { scrutinee, arms }),
+            span(),
+        );
+
+        let val = eval(&match_expr).unwrap();
+        assert!(matches!(val, Value::Int(42)));
+    }
+
+    #[test]
+    fn test_match_constructor_wrong_name() {
+        let bump = Bump::new();
+        let mut rodeo = Rodeo::default();
+        let some_ident = make_ident(&mut rodeo, "Some");
+        let none_ident = make_ident(&mut rodeo, "None");
+
+        let scrutinee = ExprKind::node(
+            bump.alloc(ExprKind::Constructor {
+                name: some_ident,
+                arg: None,
+            }),
+            span(),
+        );
+
+        // Match against None — should NOT match Some
+        let pat = Pat {
+            kind: bump.alloc(PatKind::Constructor {
+                name: none_ident,
+                arg: None,
+            }),
+            span: span(),
+        };
+        let body = lit_int(&bump, 1);
+        let fallback_pat = Pat {
+            kind: bump.alloc(PatKind::Wildcard),
+            span: span(),
+        };
+        let fallback_body = lit_int(&bump, 0);
+        let arms: &[(Pat, Expr)] = bump.alloc_slice_fill_iter([(pat, body), (fallback_pat, fallback_body)]);
+
+        let match_expr = ExprKind::node(
+            bump.alloc(ExprKind::Match { scrutinee, arms }),
+            span(),
+        );
+
+        let val = eval(&match_expr).unwrap();
+        assert!(matches!(val, Value::Int(0)));
+    }
+
+    #[test]
+    fn test_match_constructor_wildcard_fallback() {
+        let bump = Bump::new();
+        let mut rodeo = Rodeo::default();
+        let some_ident = make_ident(&mut rodeo, "Some");
+        let none_ident = make_ident(&mut rodeo, "None");
+
+        let scrutinee = ExprKind::node(
+            bump.alloc(ExprKind::Constructor {
+                name: some_ident,
+                arg: Some(lit_int(&bump, 10)),
+            }),
+            span(),
+        );
+
+        let pat = Pat {
+            kind: bump.alloc(PatKind::Constructor {
+                name: none_ident,
+                arg: None,
+            }),
+            span: span(),
+        };
+        let body = lit_int(&bump, 1);
+        let wild_pat = Pat {
+            kind: bump.alloc(PatKind::Wildcard),
+            span: span(),
+        };
+        let wild_body = lit_int(&bump, 99);
+        let arms: &[(Pat, Expr)] = bump.alloc_slice_fill_iter([(pat, body), (wild_pat, wild_body)]);
+
+        let match_expr = ExprKind::node(
+            bump.alloc(ExprKind::Match { scrutinee, arms }),
+            span(),
+        );
+
+        let val = eval(&match_expr).unwrap();
+        assert!(matches!(val, Value::Int(99)));
+    }
+
+    #[test]
+    fn test_match_constructor_arg_wrong_name() {
+        let bump = Bump::new();
+        let mut rodeo = Rodeo::default();
+        let some_ident = make_ident(&mut rodeo, "Some");
+        let none_ident = make_ident(&mut rodeo, "None");
+
+        let scrutinee = ExprKind::node(
+            bump.alloc(ExprKind::Constructor {
+                name: some_ident,
+                arg: None,
+            }),
+            span(),
+        );
+
+        // Match against None (with wildcard arg pattern)
+        let wild_pat = Pat {
+            kind: bump.alloc(PatKind::Wildcard),
+            span: span(),
+        };
+        let pat = Pat {
+            kind: bump.alloc(PatKind::Constructor {
+                name: none_ident,
+                arg: Some(&*bump.alloc(wild_pat)),
+            }),
+            span: span(),
+        };
+        let body = lit_int(&bump, 1);
+        let fallback_pat = Pat {
+            kind: bump.alloc(PatKind::Wildcard),
+            span: span(),
+        };
+        let fallback_body = lit_int(&bump, 0);
+        let arms: &[(Pat, Expr)] = bump.alloc_slice_fill_iter([(pat, body), (fallback_pat, fallback_body)]);
+
+        let match_expr = ExprKind::node(
+            bump.alloc(ExprKind::Match { scrutinee, arms }),
+            span(),
+        );
+
+        let val = eval(&match_expr).unwrap();
+        assert!(matches!(val, Value::Int(0)));
+    }
+
+    #[test]
+    fn test_match_constructor_or_pattern() {
+        let bump = Bump::new();
+        let mut rodeo = Rodeo::default();
+        let none_ident = make_ident(&mut rodeo, "None");
+        let some_ident = make_ident(&mut rodeo, "Some");
+
+        let scrutinee = ExprKind::node(
+            bump.alloc(ExprKind::Constructor {
+                name: none_ident,
+                arg: None,
+            }),
+            span(),
+        );
+
+        // pattern: (Some x | None) => 1, _ => 0
+        let some_var = Pat {
+            kind: bump.alloc(PatKind::Var(make_ident(&mut rodeo, "x"))),
+            span: span(),
+        };
+        let some_pat = Pat {
+            kind: bump.alloc(PatKind::Constructor {
+                name: some_ident,
+                arg: Some(&*bump.alloc(some_var)),
+            }),
+            span: span(),
+        };
+        let none_pat = Pat {
+            kind: bump.alloc(PatKind::Constructor {
+                name: none_ident,
+                arg: None,
+            }),
+            span: span(),
+        };
+        let or_pat = Pat {
+            kind: bump.alloc(PatKind::Or(
+                bump.alloc(some_pat),
+                bump.alloc(none_pat),
+            )),
+            span: span(),
+        };
+        let body = lit_int(&bump, 1);
+        let fallback_pat = Pat {
+            kind: bump.alloc(PatKind::Wildcard),
+            span: span(),
+        };
+        let fallback_body = lit_int(&bump, 0);
+        let arms: &[(Pat, Expr)] = bump.alloc_slice_fill_iter([(or_pat, body), (fallback_pat, fallback_body)]);
+
+        let match_expr = ExprKind::node(
+            bump.alloc(ExprKind::Match { scrutinee, arms }),
+            span(),
+        );
+
+        let val = eval(&match_expr).unwrap();
+        assert!(matches!(val, Value::Int(1)));
+    }
+
+    #[test]
+    fn test_match_constructor_non_exhaustive() {
+        let bump = Bump::new();
+        let mut rodeo = Rodeo::default();
+        let some_ident = make_ident(&mut rodeo, "Some");
+
+        let scrutinee = ExprKind::node(
+            bump.alloc(ExprKind::Constructor {
+                name: some_ident,
+                arg: Some(lit_int(&bump, 1)),
+            }),
+            span(),
+        );
+
+        // Only matching None, but scrutinee is Some — non-exhaustive
+        let pat = Pat {
+            kind: bump.alloc(PatKind::Constructor {
+                name: make_ident(&mut rodeo, "None"),
+                arg: None,
+            }),
+            span: span(),
+        };
+        let body = lit_int(&bump, 1);
+        let arms: &[(Pat, Expr)] = bump.alloc_slice_fill_iter([(pat, body)]);
+
+        let match_expr = ExprKind::node(
+            bump.alloc(ExprKind::Match { scrutinee, arms }),
+            span(),
+        );
+
+        let result = eval(&match_expr);
+        assert!(matches!(result, Err(EvalError::NonExhaustiveMatch)));
+    }
+
+    // ── Type expression evaluation ───────────────────────────────────
+
+    #[test]
+    fn test_type_expr_evaluates_body() {
+        let bump = Bump::new();
+        let mut rodeo = Rodeo::default();
+        let none_ident = make_ident(&mut rodeo, "None");
+        let option_ident = make_ident(&mut rodeo, "Option");
+
+        let body = ExprKind::node(
+            bump.alloc(ExprKind::Constructor {
+                name: none_ident,
+                arg: None,
+            }),
+            span(),
+        );
+
+        let type_def = TypeDef {
+            name: option_ident,
+            params: &[],
+            variants: &[],
+        };
+        let type_defs: &[TypeDef] = bump.alloc_slice_fill_iter([type_def]);
+
+        let type_expr = ExprKind::node(
+            bump.alloc(ExprKind::Type {
+                definitions: type_defs,
+                body,
+            }),
+            span(),
+        );
+
+        let val = eval(&type_expr).unwrap();
+        match val {
+            Value::Constructor { arg: None, .. } => {}
+            _ => panic!("expected Constructor from body evaluation"),
+        }
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -8,52 +8,18 @@ use chumsky::{Parser, input::Stream};
 use lasso::Rodeo;
 use logos::Logos;
 use mest_core::{
-    ast::{BindPat, BindPatKind, ExprKind, PatKind},
-    hir::Type,
     parser::parser,
     token::Token,
-    typecheck::{self, InferenceTree, Output, rename_type},
+    typecheck::{self, TypeEntryKind, TypeIndex},
 };
 
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
-use mest_core::typecheck::Input as InferInput;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BindingKind {
-    Let,
-    Param,
-    NotBinding,
-}
-
-#[derive(Clone)]
-struct AnnotationEntry {
-    end: usize,
-    ty: Type,
-    kind: BindingKind,
-}
-
-#[derive(Clone)]
-struct AnnotationMap {
-    spans: BTreeMap<usize, AnnotationEntry>,
-}
-
-impl AnnotationMap {
-    fn find_entry(&self, offset: usize) -> Option<(usize, usize, Type, BindingKind)> {
-        self.spans
-            .range(..=offset)
-            .filter(|(_, e)| offset < e.end)
-            .min_by_key(|(start, e)| e.end - *start)
-            .map(|(start, e)| (*start, e.end, e.ty.clone(), e.kind))
-    }
-}
-
 struct DocumentState {
     text: String,
-    generation: u64,
-    annotations: Option<AnnotationMap>,
+    type_index: Option<TypeIndex>,
 }
 
 pub struct Backend {
@@ -85,7 +51,15 @@ fn offset_to_lsp(text: &str, offset: usize) -> Position {
     Position::new(line, character)
 }
 
-fn build_annotations(source: &str) -> Option<AnnotationMap> {
+fn line_to_byte_offset(text: &str, line: u32) -> usize {
+    text.split('\n')
+        .take(line as usize)
+        .map(|s| s.len() + 1)
+        .sum::<usize>()
+        .min(text.len())
+}
+
+fn build_type_index(source: &str) -> Option<TypeIndex> {
     let token_iter = Token::lexer(source).spanned().map(|(tok, span)| match tok {
         Ok(tok) => (tok, span.into()),
         Err(()) => (Token::Error, span.into()),
@@ -106,191 +80,121 @@ fn build_annotations(source: &str) -> Option<AnnotationMap> {
     };
 
     let result = typecheck::typecheck(&expr, &mut rodeo);
-
-    let mut map = AnnotationMap {
-        spans: BTreeMap::new(),
-    };
-    collect_infer_nodes(&result.tree, &mut map);
-    Some(map)
-}
-
-fn collect_infer_nodes(tree: &InferenceTree, map: &mut AnnotationMap) {
-    if let InferInput::Infer { expr, .. } = &tree.input {
-        if let Output::Type(ty) = &tree.output {
-            let range: std::ops::Range<usize> = expr.span.into_range();
-            map.spans.insert(
-                range.start,
-                AnnotationEntry {
-                    end: range.end,
-                    ty: rename_type(ty),
-                    kind: BindingKind::NotBinding,
-                },
-            );
-
-            match &*expr.kind {
-                ExprKind::Let { .. } => {}
-                ExprKind::Abs { param, .. } => {
-                    if let Output::Type(ty) = &tree.output {
-                        if let Type::Arrow(_, _) = ty {
-                            if matches!(*param.kind, PatKind::Var(_)) {
-                                let renamed = rename_type(ty);
-                                if let Type::Arrow(param_ty, _) = &renamed {
-                                    let ident_range: std::ops::Range<usize> =
-                                        param.span.into_range();
-                                    map.spans.insert(
-                                        ident_range.start,
-                                        AnnotationEntry {
-                                            end: ident_range.end,
-                                            ty: (**param_ty).clone(),
-                                            kind: BindingKind::Param,
-                                        },
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    for child in &tree.children {
-        collect_infer_nodes(child, map);
-    }
-    if let InferInput::Infer { expr, .. } = &tree.input {
-        if let Output::Type(_) = &tree.output {
-            if let ExprKind::Let { bindings, .. } = &*expr.kind {
-                for binding in bindings.iter() {
-                    let value_span: std::ops::Range<usize> =
-                        binding.value.span.into_range();
-                    if let Some(child) = tree.children.iter().find(|c| {
-                        if let InferInput::Infer { expr, .. } = &c.input {
-                            let expr_range: std::ops::Range<usize> =
-                                expr.span.into_range();
-                            expr_range == value_span
-                        } else {
-                            false
-                        }
-                    }) {
-                        if let Output::Type(val_ty) = &child.output {
-                            let renamed = rename_type(val_ty);
-                            collect_bind_pat_types(&binding.pat, &renamed, map);
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn collect_bind_pat_types(pat: &BindPat, ty: &Type, map: &mut AnnotationMap) {
-    match pat.kind {
-        BindPatKind::Var(name) => {
-            let ident_range: std::ops::Range<usize> = name.span.into_range();
-            map.spans.insert(
-                ident_range.start,
-                AnnotationEntry {
-                    end: ident_range.end,
-                    ty: ty.clone(),
-                    kind: BindingKind::Let,
-                },
-            );
-        }
-        BindPatKind::Tuple(pats) => {
-            if let Type::Tuple(types) = ty {
-                for (sub_pat, sub_ty) in pats.iter().zip(types.iter()) {
-                    collect_bind_pat_types(sub_pat, sub_ty, map);
-                }
-            }
-        }
-    }
+    Some(result.type_index)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mest_core::hir::Type;
 
     #[test]
-    fn test_annotations_let_var_binding() {
+    fn test_type_index_let_var_binding() {
         let source = "let x = 1 in x";
-        let map = build_annotations(source).unwrap();
+        let ti = build_type_index(source).unwrap();
         let x_binding_offset = source.find("x").unwrap();
-        assert!(
-            map.spans.contains_key(&x_binding_offset),
-            "expected annotation for binding 'x' at offset {}",
-            x_binding_offset
-        );
-        let entry = map.spans.get(&x_binding_offset).unwrap();
-        assert_eq!(entry.kind, BindingKind::Let);
+        let entry = ti.node_at(x_binding_offset).unwrap();
+        assert_eq!(entry.kind, TypeEntryKind::LetBinding);
         assert_eq!(entry.ty, Type::Int);
     }
 
     #[test]
-    fn test_annotations_let_tuple_binding() {
+    fn test_type_index_let_tuple_binding() {
         let source = "let (a, b) = (1, true) in b";
-        let map = build_annotations(source).unwrap();
+        let ti = build_type_index(source).unwrap();
         let a_offset = source.find('a').unwrap();
-        assert!(
-            map.spans.contains_key(&a_offset),
-            "expected annotation for binding 'a' at offset {}",
-            a_offset
-        );
-        let a_entry = map.spans.get(&a_offset).unwrap();
-        assert_eq!(a_entry.kind, BindingKind::Let);
+        let a_entry = ti.node_at(a_offset).unwrap();
+        assert_eq!(a_entry.kind, TypeEntryKind::LetBinding);
         assert_eq!(a_entry.ty, Type::Int);
         let eq_pos = source.find('=').unwrap();
         let binding_b_offset = source[..eq_pos].rfind('b').unwrap();
-        assert!(
-            map.spans.contains_key(&binding_b_offset),
-            "expected annotation for binding 'b' at offset {}",
-            binding_b_offset
-        );
-        let b_entry = map.spans.get(&binding_b_offset).unwrap();
-        assert_eq!(b_entry.kind, BindingKind::Let);
+        let b_entry = ti.node_at(binding_b_offset).unwrap();
+        assert_eq!(b_entry.kind, TypeEntryKind::LetBinding);
         assert_eq!(b_entry.ty, Type::Bool);
     }
 
     #[test]
-    fn test_annotations_let_and_bindings() {
+    fn test_type_index_let_and_bindings() {
         let source = "let a = 1 and b = true in b";
-        let map = build_annotations(source).unwrap();
+        let ti = build_type_index(source).unwrap();
         let a_offset = source.find('a').unwrap();
-        assert_eq!(map.spans.get(&a_offset).unwrap().kind, BindingKind::Let);
-        assert_eq!(map.spans.get(&a_offset).unwrap().ty, Type::Int);
+        assert_eq!(
+            ti.node_at(a_offset).unwrap().kind,
+            TypeEntryKind::LetBinding
+        );
+        assert_eq!(ti.node_at(a_offset).unwrap().ty, Type::Int);
         let eq_first = source.find('=').unwrap();
         let eq_second = source[eq_first + 1..].find('=').unwrap() + eq_first + 1;
         let b_binding_offset = source[..eq_second].rfind('b').unwrap();
+        assert_eq!(ti.node_at(b_binding_offset).unwrap().ty, Type::Bool);
+    }
+
+    #[test]
+    fn test_type_index_swap_tuple_pattern() {
+        let source = "let swap = |(a, b)| (b, a) in swap";
+        let ti = build_type_index(source).unwrap();
+        let pipe = source.find('|').unwrap();
+        let a_in_pattern = source[pipe..].find('a').unwrap() + pipe;
+        let b_in_pattern = source[pipe..].find('b').unwrap() + pipe;
+        let a_entry = ti.node_at(a_in_pattern).unwrap();
+        let b_entry = ti.node_at(b_in_pattern).unwrap();
+        assert_eq!(a_entry.kind, TypeEntryKind::ParamBinding);
+        assert_eq!(b_entry.kind, TypeEntryKind::ParamBinding);
+        assert_ne!(
+            a_entry.ty, b_entry.ty,
+            "a and b should have different types after renaming"
+        );
+        match (&a_entry.ty, &b_entry.ty) {
+            (Type::Var(av), Type::Var(bv)) => {
+                assert_ne!(av, bv, "a and b should be different type variables")
+            }
+            _ => panic!("expected Var types for a and b"),
+        }
+    }
+
+    #[test]
+    fn test_type_index_scope_independent_renaming() {
+        let source = "let const = |x| |y| x in let id = |x| x in id const";
+        let ti = build_type_index(source).unwrap();
+        let id_binding_offset = source.find("id").unwrap();
+        let id_entry = ti.node_at(id_binding_offset).unwrap();
+        assert_eq!(id_entry.kind, TypeEntryKind::LetBinding);
+        let id_display = id_entry.ty.to_string();
         assert_eq!(
-            map.spans.get(&b_binding_offset).unwrap().ty,
-            Type::Bool
+            id_display, "(τ) -> τ",
+            "id should show (τ) -> τ, got: {id_display}"
         );
     }
 }
 
 impl Backend {
-    fn schedule_update(&self, uri: Url, generation: u64) {
+    fn delayed_typecheck(&self, uri: Url) {
         let documents = self.documents.clone();
+        let client = self.client.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(300)).await;
 
-            let (text, gen_id) = {
+            let text = {
                 let docs = documents.lock().unwrap();
-                match docs.get(&uri) {
-                    Some(doc) => (doc.text.clone(), doc.generation),
-                    None => return,
-                }
+                docs.get(&uri).map(|d| d.text.clone())
             };
+            let Some(text) = text else { return };
 
-            if gen_id != generation {
-                return;
+            let type_index = build_type_index(&text);
+            {
+                let mut docs = documents.lock().unwrap();
+                if let Some(doc) = docs.get_mut(&uri) {
+                    doc.type_index = type_index;
+                }
             }
 
-            let annotations = build_annotations(&text);
-            let mut docs = documents.lock().unwrap();
-            if let Some(doc) = docs.get_mut(&uri) {
-                if doc.generation == generation {
-                    doc.annotations = annotations;
-                }
+            if let Err(e) = client
+                .send_request::<tower_lsp::lsp_types::request::InlayHintRefreshRequest>(())
+                .await
+            {
+                client
+                    .log_message(MessageType::WARNING, format!("refresh failed: {e}"))
+                    .await;
             }
         });
     }
@@ -326,36 +230,38 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri;
         let text = params.text_document.text;
 
-        let annotations = build_annotations(&text);
+        let type_index = build_type_index(&text);
 
-        let mut docs = self.documents.lock().unwrap();
-        docs.insert(
-            uri,
-            DocumentState {
-                text,
-                generation: 0,
-                annotations,
-            },
-        );
+        {
+            let mut docs = self.documents.lock().unwrap();
+            docs.insert(uri.clone(), DocumentState { text, type_index });
+        }
+
+        if let Err(e) = self
+            .client
+            .send_request::<tower_lsp::lsp_types::request::InlayHintRefreshRequest>(())
+            .await
+        {
+            self.client
+                .log_message(MessageType::WARNING, format!("refresh failed: {e}"))
+                .await;
+        }
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri;
         let new_text = params.content_changes.into_iter().last().unwrap().text;
 
-        let gen_id = {
+        {
             let mut docs = self.documents.lock().unwrap();
             let doc = docs.entry(uri.clone()).or_insert(DocumentState {
                 text: String::new(),
-                generation: 0,
-                annotations: None,
+                type_index: None,
             });
-            doc.text = new_text.clone();
-            doc.generation += 1;
-            doc.generation
-        };
+            doc.text = new_text;
+        }
 
-        self.schedule_update(uri, gen_id);
+        self.delayed_typecheck(uri);
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -386,41 +292,32 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
 
-        let (ty_str, kind) = {
+        let entry = {
             let docs = self.documents.lock().unwrap();
             let doc = match docs.get(&uri) {
                 Some(doc) => doc,
                 None => return Ok(None),
             };
-            let annotations = match doc.annotations.as_ref() {
-                Some(a) => a,
+            let type_index = match doc.type_index.as_ref() {
+                Some(ti) => ti,
                 None => return Ok(None),
             };
-            match annotations.find_entry(offset) {
-                Some((_, _, ty, kind)) => (ty.to_string(), kind),
+            match type_index.node_at(offset) {
+                Some(e) => (e.start, e.end, e.ty.clone(), e.kind),
                 None => return Ok(None),
             }
         };
 
-        let word_at = |offset: usize| -> (usize, usize) {
-            let start = text[..offset]
-                .rfind(|c: char| !c.is_alphanumeric() && c != '_')
-                .map(|i| i + 1)
-                .unwrap_or(0);
-            let end = text[offset..]
-                .find(|c: char| !c.is_alphanumeric() && c != '_')
-                .map(|i| offset + i)
-                .unwrap_or(text.len());
-            (start, end)
-        };
-
-        let (word_start, word_end) = word_at(offset);
-        let word = &text[word_start..word_end];
+        let (start, end, ty, kind) = entry;
+        let ty_str = ty.to_string();
+        let word = &text[start..end];
 
         let hover_value = match kind {
-            BindingKind::Let => format!("```mest\nlet {}: {}\n```", word, ty_str),
-            BindingKind::Param => format!("```mest\n{}: {}\n```", word, ty_str),
-            BindingKind::NotBinding => format!("```mest\n: {}\n```", ty_str),
+            TypeEntryKind::LetBinding => format!("```mest\nlet {}: {}\n```", word, ty_str),
+            TypeEntryKind::ParamBinding | TypeEntryKind::MatchBinding => {
+                format!("```mest\n{}: {}\n```", word, ty_str)
+            }
+            TypeEntryKind::Expr => format!("```mest\n: {}\n```", ty_str),
         };
 
         Ok(Some(Hover {
@@ -429,8 +326,8 @@ impl LanguageServer for Backend {
                 value: hover_value,
             }),
             range: Some(Range {
-                start: offset_to_lsp(&text, word_start),
-                end: offset_to_lsp(&text, word_end),
+                start: offset_to_lsp(&text, start),
+                end: offset_to_lsp(&text, end),
             }),
         }))
     }
@@ -447,39 +344,35 @@ impl LanguageServer for Backend {
             }
         };
 
-        let entries = {
+        let byte_start = line_to_byte_offset(&text, range.start.line);
+        let byte_end = line_to_byte_offset(&text, range.end.line + 1).max(byte_start);
+
+        let entries: Vec<(usize, String)> = {
             let docs = self.documents.lock().unwrap();
             let doc = match docs.get(&uri) {
                 Some(doc) => doc,
                 None => return Ok(None),
             };
-            let annotations = match doc.annotations.as_ref() {
-                Some(a) => a,
+            let type_index = match doc.type_index.as_ref() {
+                Some(ti) => ti,
                 None => return Ok(None),
             };
-
-            let result: Vec<_> = annotations
-                .spans
-                .iter()
-                .filter(|(_, e)| e.kind == BindingKind::Let || e.kind == BindingKind::Param)
-                .filter(|(_, e)| {
-                    let pos = offset_to_lsp(&doc.text, e.end);
-                    pos.line >= range.start.line && pos.line <= range.end.line
-                })
-                .map(|(start, e)| (*start, e.end, e.ty.clone()))
-                .collect();
-            result
+            type_index
+                .entries_in_range(byte_start..byte_end)
+                .into_iter()
+                .map(|e| (e.end, e.ty.to_string()))
+                .collect()
         };
 
         let hints: Vec<InlayHint> = entries
             .into_iter()
-            .map(|(_, end, ty)| {
+            .map(|(end, ty_str)| {
                 let pos = offset_to_lsp(&text, end);
                 InlayHint {
                     position: pos,
-                    label: InlayHintLabel::String(format!(":{}", ty)),
+                    label: InlayHintLabel::String(format!(": {}", ty_str)),
                     kind: Some(InlayHintKind::TYPE),
-                    padding_left: Some(true),
+                    padding_left: Some(false),
                     padding_right: None,
                     text_edits: None,
                     tooltip: None,
