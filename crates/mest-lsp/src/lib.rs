@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bumpalo::Bump;
+use chumsky::input::Input;
 use chumsky::{Parser, input::Stream};
 use lasso::Rodeo;
 use logos::Logos;
@@ -20,19 +21,21 @@ use tower_lsp::{Client, LanguageServer};
 
 use mest_core::typecheck::Input as InferInput;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BindingKind {
     Let,
     Param,
     NotBinding,
 }
 
+#[derive(Clone)]
 struct AnnotationEntry {
     end: usize,
     ty: Type,
     kind: BindingKind,
 }
 
+#[derive(Clone)]
 struct AnnotationMap {
     spans: BTreeMap<usize, AnnotationEntry>,
 }
@@ -125,26 +128,7 @@ fn collect_infer_nodes(tree: &InferenceTree, map: &mut AnnotationMap) {
             );
 
             match &*expr.kind {
-                ExprKind::Let { bindings, .. } => {
-                    for binding in bindings.iter() {
-                        let value_span: std::ops::Range<usize> =
-                            binding.value.span.into_range();
-                        if let Some(child) = tree.children.iter().find(|c| {
-                            if let InferInput::Infer { expr, .. } = &c.input {
-                                let expr_range: std::ops::Range<usize> =
-                                    expr.span.into_range();
-                                expr_range == value_span
-                            } else {
-                                false
-                            }
-                        }) {
-                            if let Output::Type(val_ty) = &child.output {
-                                let renamed = rename_type(val_ty);
-                                collect_bind_pat_types(&binding.pat, &renamed, map);
-                            }
-                        }
-                    }
-                }
+                ExprKind::Let { .. } => {}
                 ExprKind::Abs { param, .. } => {
                     if let Output::Type(ty) = &tree.output {
                         if let Type::Arrow(_, _) = ty {
@@ -173,6 +157,30 @@ fn collect_infer_nodes(tree: &InferenceTree, map: &mut AnnotationMap) {
     for child in &tree.children {
         collect_infer_nodes(child, map);
     }
+    if let InferInput::Infer { expr, .. } = &tree.input {
+        if let Output::Type(_) = &tree.output {
+            if let ExprKind::Let { bindings, .. } = &*expr.kind {
+                for binding in bindings.iter() {
+                    let value_span: std::ops::Range<usize> =
+                        binding.value.span.into_range();
+                    if let Some(child) = tree.children.iter().find(|c| {
+                        if let InferInput::Infer { expr, .. } = &c.input {
+                            let expr_range: std::ops::Range<usize> =
+                                expr.span.into_range();
+                            expr_range == value_span
+                        } else {
+                            false
+                        }
+                    }) {
+                        if let Output::Type(val_ty) = &child.output {
+                            let renamed = rename_type(val_ty);
+                            collect_bind_pat_types(&binding.pat, &renamed, map);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn collect_bind_pat_types(pat: &BindPat, ty: &Type, map: &mut AnnotationMap) {
@@ -195,6 +203,67 @@ fn collect_bind_pat_types(pat: &BindPat, ty: &Type, map: &mut AnnotationMap) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_annotations_let_var_binding() {
+        let source = "let x = 1 in x";
+        let map = build_annotations(source).unwrap();
+        let x_binding_offset = source.find("x").unwrap();
+        assert!(
+            map.spans.contains_key(&x_binding_offset),
+            "expected annotation for binding 'x' at offset {}",
+            x_binding_offset
+        );
+        let entry = map.spans.get(&x_binding_offset).unwrap();
+        assert_eq!(entry.kind, BindingKind::Let);
+        assert_eq!(entry.ty, Type::Int);
+    }
+
+    #[test]
+    fn test_annotations_let_tuple_binding() {
+        let source = "let (a, b) = (1, true) in b";
+        let map = build_annotations(source).unwrap();
+        let a_offset = source.find('a').unwrap();
+        assert!(
+            map.spans.contains_key(&a_offset),
+            "expected annotation for binding 'a' at offset {}",
+            a_offset
+        );
+        let a_entry = map.spans.get(&a_offset).unwrap();
+        assert_eq!(a_entry.kind, BindingKind::Let);
+        assert_eq!(a_entry.ty, Type::Int);
+        let eq_pos = source.find('=').unwrap();
+        let binding_b_offset = source[..eq_pos].rfind('b').unwrap();
+        assert!(
+            map.spans.contains_key(&binding_b_offset),
+            "expected annotation for binding 'b' at offset {}",
+            binding_b_offset
+        );
+        let b_entry = map.spans.get(&binding_b_offset).unwrap();
+        assert_eq!(b_entry.kind, BindingKind::Let);
+        assert_eq!(b_entry.ty, Type::Bool);
+    }
+
+    #[test]
+    fn test_annotations_let_and_bindings() {
+        let source = "let a = 1 and b = true in b";
+        let map = build_annotations(source).unwrap();
+        let a_offset = source.find('a').unwrap();
+        assert_eq!(map.spans.get(&a_offset).unwrap().kind, BindingKind::Let);
+        assert_eq!(map.spans.get(&a_offset).unwrap().ty, Type::Int);
+        let eq_first = source.find('=').unwrap();
+        let eq_second = source[eq_first + 1..].find('=').unwrap() + eq_first + 1;
+        let b_binding_offset = source[..eq_second].rfind('b').unwrap();
+        assert_eq!(
+            map.spans.get(&b_binding_offset).unwrap().ty,
+            Type::Bool
+        );
     }
 }
 
