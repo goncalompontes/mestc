@@ -1,0 +1,4 @@
+type Answer = | Yes Int | No Int in
+match No 42
+| Yes x => 0
+| No x => x

@@ -1,0 +1,4 @@
+type Bool = | True | False in
+match True
+| True => 1
+| False => 2

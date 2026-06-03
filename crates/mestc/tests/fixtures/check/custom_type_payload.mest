@@ -1,0 +1,1 @@
+type Answer = | Yes | No Int in No 42

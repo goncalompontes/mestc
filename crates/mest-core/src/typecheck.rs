@@ -4,14 +4,15 @@ use std::ops::Range;
 use chumsky::span::SimpleSpan;
 use im::HashSet;
 use itertools::Itertools;
-use lasso::Rodeo;
+use lasso::{Rodeo, Spur};
 use thiserror::Error;
 
 use crate::{
     ast::{
-        BinOp, BindPat, BindPatKind, Binding, Expr, ExprKind, Ident, Literal, Pat, PatKind, UnaryOp,
+        BinOp, BindPat, BindPatKind, Binding, Expr, ExprKind, Ident, Literal, Pat, PatKind,
+        TypeExpr, TypeExprKind, UnaryOp,
     },
-    hir::{RecordField, Type, TypeVar},
+    hir::{type_to_string, RecordField, Type, TypeVar},
 };
 
 // Type schemes for polymorphic types
@@ -75,7 +76,7 @@ impl InferenceError {
         }
     }
 
-    fn label(&self) -> String {
+    fn label_with_rodeo(&self, rodeo: &Rodeo) -> String {
         match self {
             Self::UnboundVariable { name, .. } => {
                 format!("`{name}` is not defined in this scope")
@@ -83,10 +84,17 @@ impl InferenceError {
             Self::UnificationFailure {
                 expected, actual, ..
             } => {
-                format!("expected `{expected}`, found `{actual}`")
+                format!(
+                    "expected `{}`, found `{}`",
+                    type_to_string(expected, rodeo),
+                    type_to_string(actual, rodeo),
+                )
             }
             Self::OccursCheck { var, ty, .. } => {
-                format!("type variable `{var}` occurs in `{ty}`")
+                format!(
+                    "type variable `{var}` occurs in `{}`",
+                    type_to_string(ty, rodeo),
+                )
             }
             Self::TupleLengthMismatch {
                 left_len,
@@ -102,6 +110,7 @@ impl InferenceError {
     pub fn to_report<'a>(
         &self,
         source_id: &'a str,
+        rodeo: &Rodeo,
     ) -> ariadne::Report<'a, (&'a str, Range<usize>)> {
         let span = self.span().into_range();
         ariadne::Report::build(ariadne::ReportKind::Error, (source_id, span.clone()))
@@ -110,7 +119,7 @@ impl InferenceError {
             .with_message(self.to_string())
             .with_label(
                 ariadne::Label::new((source_id, span))
-                    .with_message(self.label())
+                    .with_message(self.label_with_rodeo(rodeo))
                     .with_color(ariadne::Color::Red),
             )
             .finish()
@@ -139,6 +148,9 @@ fn pat_vars(pat: &Pat) -> BTreeSet<Ident> {
             Some(pat) => pat_vars(pat),
             None => BTreeSet::new(),
         },
+        PatKind::App { .. } => {
+            todo!("PatKind::App should have been resolved before typecheck")
+        }
     }
 }
 
@@ -395,11 +407,11 @@ impl<'a> InferenceTree<'a> {
                 let _ = write!(buf, "{}", " ⇒".paint(theme.op));
             }
             Input::Unify { left, right } => {
-                let dl = rename_type(left);
-                let dr = rename_type(right);
-                let _ = write!(buf, "{}", format!("{}", dl).paint(theme.ty));
+                let dl = type_to_string(left, rodeo);
+                let dr = type_to_string(right, rodeo);
+                let _ = write!(buf, "{}", dl.paint(theme.ty));
                 let _ = write!(buf, "{}", " ~ ".paint(theme.op));
-                let _ = write!(buf, "{}", format!("{}", dr).paint(theme.ty));
+                let _ = write!(buf, "{}", dr.paint(theme.ty));
             }
             Input::Pat(s) => {
                 let _ = write!(buf, "{}", s.paint(theme.expr));
@@ -410,10 +422,11 @@ impl<'a> InferenceTree<'a> {
         match &self.output {
             Output::Type(ty) => {
                 let dty = rename_type(ty);
+                let s = type_to_string(&dty, rodeo);
                 if self.rule == RuleName::TError {
-                    let _ = write!(buf, "{}", format!("{}", dty).paint(theme.error));
+                    let _ = write!(buf, "{}", s.paint(theme.error));
                 } else {
-                    let _ = write!(buf, "{}", format!("{}", dty).paint(theme.ty));
+                    let _ = write!(buf, "{}", s.paint(theme.ty));
                 }
             }
             Output::Str(s) => {
@@ -531,6 +544,8 @@ pub struct TypeInference<'rodeo> {
     counter: u64,
     rodeo: &'rodeo mut Rodeo,
     errors: Vec<InferenceError>,
+    /// type_name → [(constructor_name, optional_payload_type)]
+    type_defs: HashMap<Spur, Vec<(Spur, Option<Type>)>>,
 }
 
 impl<'rodeo> TypeInference<'rodeo> {
@@ -586,7 +601,7 @@ impl<'rodeo> TypeInference<'rodeo> {
             Type::Tuple(types) => {
                 Type::Tuple(types.iter().map(|ty| Self::apply_type(s, ty)).collect())
             }
-            Type::Int | Type::Bool | Type::Float => ty.clone(),
+            Type::Int | Type::Bool | Type::Float | Type::Unit => ty.clone(),
             Type::Error | Type::Never => ty.clone(),
             Type::App(name, args) => Type::App(
                 *name,
@@ -754,6 +769,33 @@ impl<'rodeo> TypeInference<'rodeo> {
                 );
                 (subst, tree)
             }
+            (Type::App(n1, a1), Type::App(n2, a2)) if n1 == n2 => {
+                if a1.len() != a2.len() {
+                    return error(this, other, "type app arity mismatch");
+                }
+                let mut subst = Subst::empty();
+                let mut trees = Vec::new();
+                for (t1, t2) in a1.iter().zip(a2.iter()) {
+                    let (s, tree) = self.unify(
+                        &Self::apply_type(&subst, t1),
+                        &Self::apply_type(&subst, t2),
+                        span,
+                    );
+                    subst = s.compose(&subst);
+                    trees.push(tree);
+                }
+                let output = self.pretty_subst(&subst);
+                let tree = InferenceTree::new(
+                    RuleName::UnifyBase,
+                    Input::Unify {
+                        left: this.clone(),
+                        right: other.clone(),
+                    },
+                    output,
+                    trees,
+                );
+                (subst, tree)
+            }
             _ => {
                 self.emit_error(InferenceError::UnificationFailure {
                     span,
@@ -806,16 +848,133 @@ impl<'rodeo> TypeInference<'rodeo> {
             ExprKind::Abs { param, body } => self.infer_abs(env, expr, entries, param, body),
             ExprKind::App { func, arg } => self.infer_app(env, expr, entries, func, arg),
             ExprKind::Tuple(items) => self.infer_tuple(env, expr, entries, items),
-            ExprKind::Type { body, .. } => self.infer(env, body, entries),
-            ExprKind::Constructor { .. } => {
-                // TODO: infer constructor type from type environment
-                let ty = Type::Var(self.fresh_tyvar());
-                let tree = InferenceTree::new(RuleName::TVar, Input::Infer { env: String::new(), expr }, ty.clone(), vec![]);
-                (Subst::empty(), ty, tree)
+            ExprKind::Type { definitions, body } => {
+                self.load_type_defs(definitions);
+                self.infer(env, body, entries)
+            }
+            ExprKind::Constructor { name, arg } => {
+                self.infer_constructor(env, expr, entries, name, arg)
             }
         };
         self.push_entry(entries, expr.span, &ty, TypeEntryKind::Expr);
         (subst, ty, tree)
+    }
+
+    fn type_expr_to_type(&mut self, te: &TypeExpr) -> Type {
+        match te.kind {
+            TypeExprKind::Builtin("Int") => Type::Int,
+            TypeExprKind::Builtin("Float") => Type::Float,
+            TypeExprKind::Builtin("Bool") => Type::Bool,
+            TypeExprKind::Builtin(_) => Type::Error,
+            TypeExprKind::Var(_) => {
+                // Type variables: create a fresh type variable
+                Type::Var(self.fresh_tyvar())
+            }
+            TypeExprKind::Named(ident) => {
+                Type::App(ident.name, vec![])
+            }
+            TypeExprKind::Tuple(types) => {
+                Type::Tuple(types.iter().map(|t| self.type_expr_to_type(t)).collect())
+            }
+            TypeExprKind::Arrow { from, to } => {
+                Type::Arrow(
+                    Box::new(self.type_expr_to_type(from)),
+                    Box::new(self.type_expr_to_type(to)),
+                )
+            }
+        }
+    }
+
+    fn load_type_defs(&mut self, definitions: &[crate::ast::TypeDef]) {
+        for def in definitions {
+            let mut variants = Vec::new();
+            for v in def.variants.iter() {
+                let payload = v.arg.map(|te| self.type_expr_to_type(&te));
+                variants.push((v.name.name, payload));
+            }
+            self.type_defs.insert(def.name.name, variants);
+        }
+    }
+
+    fn infer_constructor<'a>(
+        &mut self,
+        _env: &Env,
+        expr: &'a Expr<'a>,
+        entries: &mut Vec<TypeEntry>,
+        name: &Ident,
+        arg: &'a Option<Expr<'a>>,
+    ) -> (Subst, Type, InferenceTree<'a>) {
+        // Look up the constructor name in type_defs
+        let cn = name.name;
+        let found = self.type_defs.iter().find_map(|(type_name, variants)| {
+            variants.iter().find_map(|(vname, payload)| {
+                if *vname == cn {
+                    Some((*type_name, payload.clone()))
+                } else {
+                    None
+                }
+            })
+        });
+
+        match found {
+            Some((type_name, payload_ty)) => {
+                let expected_arg_ty = payload_ty.unwrap_or(Type::Unit);
+                let (subst, constructor_ty, tree) = match arg {
+                    Some(arg_expr) => {
+                        let (subst, arg_ty, arg_tree) =
+                            self.infer(_env, arg_expr, entries);
+                        let (s, unify_tree) =
+                            self.unify(&arg_ty, &expected_arg_ty, expr.span);
+                        let combined = s.compose(&subst);
+                        let constructor_ty = Type::App(type_name, vec![
+                            Self::apply_type(&combined, &expected_arg_ty),
+                        ]);
+                        let tree = InferenceTree::new(
+                            RuleName::TApp,
+                            Input::Infer {
+                                env: String::new(),
+                                expr,
+                            },
+                            constructor_ty.clone(),
+                            vec![arg_tree, unify_tree],
+                        );
+                        (combined, constructor_ty, tree)
+                    }
+                    None => {
+                        let constructor_ty = Type::App(type_name, vec![]);
+                        let tree = InferenceTree::new(
+                            RuleName::TVar,
+                            Input::Infer {
+                                env: String::new(),
+                                expr,
+                            },
+                            constructor_ty.clone(),
+                            vec![],
+                        );
+                        (Subst::empty(), constructor_ty, tree)
+                    }
+                };
+                self.push_entry(entries, name.span, &constructor_ty, TypeEntryKind::Expr);
+                (subst, constructor_ty, tree)
+            }
+            None => {
+                self.emit_error(InferenceError::UnboundVariable {
+                    span: expr.span,
+                    name: self.rodeo.resolve(&cn).to_owned(),
+                });
+                let constructor_ty = Type::Var(self.fresh_tyvar());
+                let tree = InferenceTree::new(
+                    RuleName::TError,
+                    Input::Infer {
+                        env: String::new(),
+                        expr,
+                    },
+                    constructor_ty.clone(),
+                    vec![],
+                );
+                (Subst::empty(), constructor_ty, tree)
+            }
+        }
     }
 
     fn infer_var<'a>(
@@ -1294,22 +1453,69 @@ impl<'rodeo> TypeInference<'rodeo> {
                 );
                 (tuple_ty, all_bindings, tree)
             }
-            PatKind::Constructor { name: _, arg } => {
-                let ty = Type::Var(self.fresh_tyvar());
-                let (_child_ty, bindings, child_tree) = match arg {
-                    Some(pat) => self.infer_pat(pat),
+            PatKind::Constructor { name, arg } => {
+                let cn = name.name;
+                let found = self.type_defs.iter().find_map(|(type_name, variants)| {
+                    variants.iter().find_map(|(vname, payload)| {
+                        if *vname == cn {
+                            Some((*type_name, payload.clone()))
+                        } else {
+                            None
+                        }
+                    })
+                });
+                match found {
+                    Some((type_name, payload_ty)) => {
+                        let (pat_type, bindings, child_tree) = match (arg, &payload_ty) {
+                            (Some(pat), Some(payload_ty)) => {
+                                let (cty, b, t) = self.infer_pat(pat);
+                                let (s, unify_tree) = self.unify(&cty, payload_ty, pat.span);
+                                let unified = Self::apply_type(&s, &cty);
+                                let bindings: Vec<_> = b.into_iter()
+                                    .map(|(id, scheme)| (id, Self::apply_scheme(&s, &scheme)))
+                                    .collect();
+                                let tree = InferenceTree::new(RuleName::TPatTuple, Input::Pat("<constructor-arg>".into()), unified.clone(), vec![t, unify_tree]);
+                                (Type::App(type_name, vec![unified]), bindings, tree)
+                            }
+                            (None, None) => {
+                                let tree = InferenceTree::new(RuleName::TPatWild, Input::Pat("_".into()), Type::Unit, vec![]);
+                                (Type::App(type_name, vec![]), vec![], tree)
+                            }
+                            _ => {
+                                let ty = Type::Var(self.fresh_tyvar());
+                                let tree = InferenceTree::new(RuleName::TError, Input::Pat("<constructor-arg-mismatch>".into()), ty.clone(), vec![]);
+                                (ty, vec![], tree)
+                            }
+                        };
+                        let tree = InferenceTree::new(
+                            RuleName::TPatVar,
+                            Input::Pat(format!("<{}>", self.rodeo.resolve(&cn))),
+                            pat_type.clone(),
+                            vec![child_tree],
+                        );
+                        (pat_type, bindings, tree)
+                    }
                     None => {
-                        let wild_ty = Type::Var(self.fresh_tyvar());
-                        (wild_ty.clone(), vec![], InferenceTree::new(RuleName::TPatWild, Input::Pat("_".into()), wild_ty, vec![]))
-                    },
-                };
-                let tree = InferenceTree::new(
-                    RuleName::TPatVar,
-                    Input::Pat("<constructor>".into()),
-                    ty.clone(),
-                    vec![child_tree],
-                );
-                (ty, bindings, tree)
+                        let ty = Type::Var(self.fresh_tyvar());
+                        let (_child_ty, bindings, child_tree) = match arg {
+                            Some(pat) => self.infer_pat(pat),
+                            None => {
+                                let wild_ty = Type::Var(self.fresh_tyvar());
+                                (wild_ty.clone(), vec![], InferenceTree::new(RuleName::TPatWild, Input::Pat("_".into()), wild_ty, vec![]))
+                            },
+                        };
+                        let tree = InferenceTree::new(
+                            RuleName::TPatVar,
+                            Input::Pat("<constructor>".into()),
+                            ty.clone(),
+                            vec![child_tree],
+                        );
+                        (ty, bindings, tree)
+                    }
+                }
+            }
+            PatKind::App { .. } => {
+                todo!("PatKind::App should have been resolved before typecheck")
             }
         }
     }
@@ -1462,6 +1668,7 @@ impl<'rodeo> TypeInference<'rodeo> {
             counter: 0,
             rodeo,
             errors: Vec::new(),
+            type_defs: HashMap::new(),
         }
     }
 }
@@ -1480,7 +1687,7 @@ fn ftv_type(ty: &Type, out: &mut FreeVars) {
                 ftv_type(t, out);
             }
         }
-        Type::Int | Type::Bool | Type::Float => {}
+        Type::Int | Type::Bool | Type::Float | Type::Unit => {}
         Type::Error | Type::Never => {}
         Type::App(_, args) => {
             for t in args {
@@ -1613,7 +1820,7 @@ pub fn typecheck<'a>(expr: &'a Expr<'a>, rodeo: &mut Rodeo) -> TypeCheckResult<'
                     Type::Tuple(types) => {
                         Type::Tuple(types.iter().map(|t| apply_flat(t, map)).collect())
                     }
-                    Type::Int | Type::Bool | Type::Float | Type::Error | Type::Never => ty.clone(),
+                    Type::Int | Type::Bool | Type::Float | Type::Unit | Type::Error | Type::Never => ty.clone(),
                     Type::App(name, args) => Type::App(
                         *name,
                         args.iter().map(|t| apply_flat(t, map)).collect(),

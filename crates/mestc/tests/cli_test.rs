@@ -546,6 +546,65 @@ fn eval_inline() {
     assert_eq!(stdout.trim(), "3");
 }
 
+// ── custom type checks ────────────────────────────────────────────
+
+#[test]
+fn check_custom_type_simple() {
+    let path = fixture_path("check", "custom_type_simple.mest");
+    let path_s = path.to_str().unwrap();
+    let (stdout, stderr, ok) = run_mest(&["check", path_s]);
+    assert!(ok, "check custom_type_simple failed\nstderr: {stderr}");
+    assert!(stdout.contains(": Answer"), "stdout: {stdout:?}");
+    assert!(stdout.contains("Yes"), "stdout: {stdout:?}");
+}
+
+#[test]
+fn check_custom_type_payload() {
+    let path = fixture_path("check", "custom_type_payload.mest");
+    let path_s = path.to_str().unwrap();
+    let (stdout, stderr, ok) = run_mest(&["check", path_s]);
+    assert!(ok, "check custom_type_payload failed\nstderr: {stderr}");
+    assert!(stdout.contains(": Answer Int"), "stdout: {stdout:?}");
+}
+
+#[test]
+fn check_custom_type_match() {
+    let path = fixture_path("check", "custom_type_match.mest");
+    let path_s = path.to_str().unwrap();
+    let (stdout, stderr, ok) = run_mest(&["check", path_s]);
+    assert!(ok, "check custom_type_match failed\nstderr: {stderr}");
+    assert!(stdout.contains(": Int"), "stdout: {stdout:?}");
+}
+
+#[test]
+fn check_custom_type_match_payload() {
+    let path = fixture_path("check", "custom_type_match_payload.mest");
+    let path_s = path.to_str().unwrap();
+    let (stdout, stderr, ok) = run_mest(&["check", path_s]);
+    assert!(ok, "check custom_type_match_payload failed\nstderr: {stderr}");
+    assert!(stdout.contains(": Int"), "stdout: {stdout:?}");
+}
+
+// ── custom type runs ─────────────────────────────────────────────
+
+#[test]
+fn run_custom_type_match() {
+    let path = fixture_path("run", "custom_type_match.mest");
+    let path_s = path.to_str().unwrap();
+    let (stdout, stderr, ok) = run_mest(&["run", path_s]);
+    assert!(ok, "run custom_type_match failed\nstderr: {stderr}");
+    assert_eq!(stdout.trim(), "42");
+}
+
+#[test]
+fn run_custom_type_match_payload() {
+    let path = fixture_path("run", "custom_type_match_payload.mest");
+    let path_s = path.to_str().unwrap();
+    let (stdout, stderr, ok) = run_mest(&["run", path_s]);
+    assert!(ok, "run custom_type_match_payload failed\nstderr: {stderr}");
+    assert_eq!(stdout.trim(), "42");
+}
+
 // ── lex command ───────────────────────────────────────────────────
 
 #[test]

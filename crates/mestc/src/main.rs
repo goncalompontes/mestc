@@ -9,7 +9,8 @@ use lasso::Rodeo;
 use logos::Logos;
 use mest_core::{
     ast::Env,
-    parser::parser,
+    hir::type_to_string,
+    parser::{self, parser},
     token::Token,
     typecheck,
     visitor::AstPrinter,
@@ -69,21 +70,28 @@ fn run(src: &str, source_id: &str) {
     {
         Err(errs) => {
             for err in errs {
-                Report::build(ariadne::ReportKind::Error, (source_id, err.span().into_range()))
-                    .with_config(ariadne::Config::new().with_index_type(ariadne::IndexType::Byte))
-                    .with_code(3)
-                    .with_message(err.to_string())
-                    .with_label(
-                        Label::new((source_id, err.span().into_range()))
-                            .with_message(err.reason().to_string())
-                            .with_color(Color::Red),
-                    )
-                    .finish()
-                    .eprint((source_id, Source::from(src)))
-                    .unwrap();
+                Report::build(
+                    ariadne::ReportKind::Error,
+                    (source_id, err.span().into_range()),
+                )
+                .with_config(ariadne::Config::new().with_index_type(ariadne::IndexType::Byte))
+                .with_code(3)
+                .with_message(err.to_string())
+                .with_label(
+                    Label::new((source_id, err.span().into_range()))
+                        .with_message(err.reason().to_string())
+                        .with_color(Color::Red),
+                )
+                .finish()
+                .eprint((source_id, Source::from(src)))
+                .unwrap();
             }
         }
         Ok(expr) => {
+            let constructors = parser::collect_constructors(&expr);
+            let names = parser::constructor_names(&constructors);
+            let bump2 = Bump::new();
+            let expr = parser::resolve_constructors(&expr, &names, &bump2);
             let mut env = Env::new();
             match expr.eval_lazy(&mut env, &rodeo) {
                 Ok(res) => println!("{res}"),
@@ -124,24 +132,29 @@ fn parse(src: &str, source_id: &str) -> Result<(), ()> {
     {
         Err(errs) => {
             for err in errs {
-                Report::build(ariadne::ReportKind::Error, (source_id, err.span().into_range()))
-                    .with_config(
-                        ariadne::Config::new().with_index_type(ariadne::IndexType::Byte),
-                    )
-                    .with_code(3)
-                    .with_message(err.to_string())
-                    .with_label(
-                        Label::new((source_id, err.span().into_range()))
-                            .with_message(err.reason().to_string())
-                            .with_color(Color::Red),
-                    )
-                    .finish()
-                    .eprint((source_id, Source::from(src)))
-                    .unwrap();
+                Report::build(
+                    ariadne::ReportKind::Error,
+                    (source_id, err.span().into_range()),
+                )
+                .with_config(ariadne::Config::new().with_index_type(ariadne::IndexType::Byte))
+                .with_code(3)
+                .with_message(err.to_string())
+                .with_label(
+                    Label::new((source_id, err.span().into_range()))
+                        .with_message(err.reason().to_string())
+                        .with_color(Color::Red),
+                )
+                .finish()
+                .eprint((source_id, Source::from(src)))
+                .unwrap();
             }
             Err(())
         }
         Ok(expr) => {
+            let constructors = parser::collect_constructors(&expr);
+            let names = parser::constructor_names(&constructors);
+            let bump2 = Bump::new();
+            let expr = parser::resolve_constructors(&expr, &names, &bump2);
             println!("{}", AstPrinter::print_expr(&expr, &rodeo));
             Ok(())
         }
@@ -166,24 +179,35 @@ fn check(src: &str, source_id: &str) -> Result<(), ()> {
     {
         Err(errs) => {
             for err in errs {
-                Report::build(ariadne::ReportKind::Error, (source_id, err.span().into_range()))
-                    .with_config(ariadne::Config::new().with_index_type(ariadne::IndexType::Byte))
-                    .with_code(3)
-                    .with_message(err.to_string())
-                    .with_label(
-                        Label::new((source_id, err.span().into_range()))
-                            .with_message(err.reason().to_string())
-                            .with_color(Color::Red),
-                    )
-                    .finish()
-                    .eprint((source_id, Source::from(src)))
-                    .unwrap();
+                Report::build(
+                    ariadne::ReportKind::Error,
+                    (source_id, err.span().into_range()),
+                )
+                .with_config(ariadne::Config::new().with_index_type(ariadne::IndexType::Byte))
+                .with_code(3)
+                .with_message(err.to_string())
+                .with_label(
+                    Label::new((source_id, err.span().into_range()))
+                        .with_message(err.reason().to_string())
+                        .with_color(Color::Red),
+                )
+                .finish()
+                .eprint((source_id, Source::from(src)))
+                .unwrap();
             }
             Err(())
         }
         Ok(expr) => {
+            let constructors = parser::collect_constructors(&expr);
+            let names = parser::constructor_names(&constructors);
+            let bump2 = Bump::new();
+            let expr = parser::resolve_constructors(&expr, &names, &bump2);
             let result = typecheck::typecheck(&expr, &mut rodeo);
-            println!("{} : {}", AstPrinter::print_expr(&expr, &rodeo), result.ty);
+            println!(
+                "{} : {}",
+                AstPrinter::print_expr(&expr, &rodeo),
+                type_to_string(&result.ty, &rodeo)
+            );
             println!();
             println!("{}", result.tree.display_tree(&Default::default(), &rodeo));
 
@@ -191,13 +215,13 @@ fn check(src: &str, source_id: &str) -> Result<(), ()> {
                 Ok(())
             } else {
                 for err in &result.errors {
-                    err.to_report(source_id)
+                    err.to_report(source_id, &rodeo)
                         .eprint((source_id, Source::from(src)))
                         .unwrap();
                 }
                 Err(())
             }
-        },
+        }
     }
 }
 

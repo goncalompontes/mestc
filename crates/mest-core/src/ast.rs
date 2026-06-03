@@ -5,13 +5,13 @@ use std::{cell::RefCell, fmt, hash::Hash, ops::Deref, rc::Rc};
 
 use crate::thunk::Thunk;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct VariantDef<'bump> {
     pub name: Ident,
     pub arg: Option<TypeExpr<'bump>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct TypeDef<'bump> {
     pub name: Ident,
     pub params: &'bump [Ident],
@@ -134,6 +134,11 @@ pub enum PatKind<'bump> {
     Constructor {
         name: Ident,
         arg: Option<&'bump Pat<'bump>>,
+    },
+    /// Temporary: used during parsing before post-parse resolution converts to Constructor
+    App {
+        func: &'bump Pat<'bump>,
+        arg: &'bump Pat<'bump>,
     },
 }
 
@@ -419,6 +424,24 @@ impl<'bump> ExprKind<'bump> {
     ) -> Expr<'bump> {
         Self::node(bump.alloc(ExprKind::Tuple(items)), span)
     }
+
+    pub fn type_expr(
+        bump: &'bump Bump,
+        span: SimpleSpan,
+        definitions: &'bump [TypeDef<'bump>],
+        body: Expr<'bump>,
+    ) -> Expr<'bump> {
+        Self::node(bump.alloc(ExprKind::Type { definitions, body }), span)
+    }
+
+    pub fn constructor_expr(
+        bump: &'bump Bump,
+        span: SimpleSpan,
+        name: Ident,
+        arg: Option<Expr<'bump>>,
+    ) -> Expr<'bump> {
+        Self::node(bump.alloc(ExprKind::Constructor { name, arg }), span)
+    }
 }
 
 impl<'bump> ExprKind<'bump> {
@@ -676,6 +699,9 @@ impl<'bump> ExprKind<'bump> {
                     },
                     _ => Ok(false),
                 }
+            }
+            PatKind::App { .. } => {
+                todo!("PatKind::App should have been resolved before eval")
             }
         }
     }

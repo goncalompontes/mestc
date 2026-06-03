@@ -82,6 +82,10 @@ pub trait Visitor<'bump, Ctx>: Sized {
                     self.walk_pat(arg, ctx);
                 }
             }
+            PatKind::App { func, arg } => {
+                self.walk_pat(func, ctx);
+                self.walk_pat(arg, ctx);
+            }
         }
     }
 
@@ -391,6 +395,11 @@ fn pat_write_inline(pat: &Pat, rodeo: &Rodeo, f: &mut std::fmt::Formatter) -> st
                 write!(f, ")")?;
             }
             Ok(())
+        }
+        PatKind::App { func, arg } => {
+            pat_write_inline(func, rodeo, f)?;
+            write!(f, " ")?;
+            pat_write_inline(arg, rodeo, f)
         }
     }
 }
@@ -730,6 +739,11 @@ impl<'bump> Visitor<'bump, PrintCtx<'_>> for AstPrinter {
                     ctx.output.push(' ');
                     self.visit_pat(arg, ctx);
                 }
+            }
+            PatKind::App { func, arg } => {
+                self.visit_pat(func, ctx);
+                ctx.output.push(' ');
+                self.visit_pat(arg, ctx);
             }
         }
     }

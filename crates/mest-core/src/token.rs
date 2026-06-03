@@ -23,6 +23,8 @@ pub enum Token<'a> {
     Match,
     #[token("and")]
     And,
+    #[token("type")]
+    Type,
 
     #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice())]
     Ident(&'a str),
@@ -125,6 +127,7 @@ impl Display for Token<'_> {
             Token::And => write!(f, "and"),
             Token::Comma => write!(f, ","),
             Token::StrongArrow => write!(f, "=>"),
+            Token::Type => write!(f, "type"),
         }
     }
 }

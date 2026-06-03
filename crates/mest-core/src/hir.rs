@@ -3,6 +3,7 @@ use std::fmt;
 use chumsky::span::SimpleSpan;
 use derive_more::From;
 use itertools::Itertools;
+use lasso::Rodeo;
 
 use crate::ast::{BinOp, Ident, Literal, UnaryOp};
 
@@ -25,6 +26,7 @@ pub enum Type {
     Tuple(Vec<Type>),
     App(Spur, Vec<Type>),
     Record(Vec<RecordField>),
+    Unit,
     Error,
     Never,
 }
@@ -133,8 +135,33 @@ impl fmt::Display for Type {
                 }
             }
             Type::Record(fields) => write_record_fields(f, fields),
+            Type::Unit => write!(f, "()"),
             Type::Error => write!(f, "<error>"),
             Type::Never => write!(f, "Never"),
         }
+    }
+}
+
+pub fn type_to_string(ty: &Type, rodeo: &Rodeo) -> String {
+    match ty {
+        Type::App(name, args) => {
+            let name = rodeo.resolve(name);
+            if args.is_empty() {
+                name.to_string()
+            } else {
+                let args: Vec<_> = args.iter().map(|a| type_to_string(a, rodeo)).collect();
+                format!("{} {}", name, args.join(" "))
+            }
+        }
+        Type::Arrow(from, to) => format!("({}) -> {}", type_to_string(from, rodeo), type_to_string(to, rodeo)),
+        Type::Tuple(items) => {
+            let items: Vec<_> = items.iter().map(|a| type_to_string(a, rodeo)).collect();
+            format!("({})", items.join(", "))
+        }
+        Type::Record(fields) => {
+            let fields: Vec<_> = fields.iter().map(|f| format!("{}: {}", rodeo.resolve(&f.name), type_to_string(&f.ty, rodeo))).collect();
+            format!("{{ {} }}", fields.join(", "))
+        }
+        other => other.to_string(),
     }
 }

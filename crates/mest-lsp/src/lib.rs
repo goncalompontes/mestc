@@ -8,7 +8,8 @@ use chumsky::{Parser, input::Stream};
 use lasso::Rodeo;
 use logos::Logos;
 use mest_core::{
-    parser::parser,
+    hir::type_to_string,
+    parser::{self, parser},
     token::Token,
     typecheck::{self, TypeEntryKind, TypeIndex},
 };
@@ -17,9 +18,11 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
+mod backend;
+
 struct DocumentState {
     text: String,
-    type_index: Option<TypeIndex>,
+    typed: Option<(TypeIndex, Rodeo)>,
 }
 
 pub struct Backend {
@@ -59,7 +62,39 @@ fn line_to_byte_offset(text: &str, line: u32) -> usize {
         .min(text.len())
 }
 
-fn build_type_index(source: &str) -> Option<TypeIndex> {
+fn is_operator(tok: &Token) -> bool {
+    use Token::*;
+    matches!(
+        tok,
+        Plus | Minus
+            | Star
+            | Slash
+            | Caret
+            | EqEq
+            | BangEq
+            | Lt
+            | Gt
+            | LtEq
+            | GtEq
+            | AndAnd
+            | PipePipe
+            | Bang
+    )
+}
+
+fn operator_type(op: &Token) -> Option<String> {
+    use Token::*;
+    let sig = match op {
+        Plus | Minus | Star | Slash | Caret => "Int -> Int -> Int",
+        EqEq | BangEq | Lt | Gt | LtEq | GtEq => "Int -> Int -> Bool",
+        AndAnd | PipePipe => "Bool -> Bool -> Bool",
+        Bang => "Bool -> Bool",
+        _ => return None,
+    };
+    Some(format!("```mest\n: {}\n```", sig))
+}
+
+fn build_type_index(source: &str) -> Option<(TypeIndex, Rodeo)> {
     let token_iter = Token::lexer(source).spanned().map(|(tok, span)| match tok {
         Ok(tok) => (tok, span.into()),
         Err(()) => (Token::Error, span.into()),
@@ -79,8 +114,14 @@ fn build_type_index(source: &str) -> Option<TypeIndex> {
         Err(_) => return None,
     };
 
+    let constructors = parser::collect_constructors(&expr);
+    let names = parser::constructor_names(&constructors);
+    let bump2 = Bump::new();
+    let expr = parser::resolve_constructors(&expr, &names, &bump2);
+
     let result = typecheck::typecheck(&expr, &mut rodeo);
-    Some(result.type_index)
+    let rodeo = rodeo.0;
+    Some((result.type_index, rodeo))
 }
 
 #[cfg(test)]
@@ -91,7 +132,7 @@ mod tests {
     #[test]
     fn test_type_index_let_var_binding() {
         let source = "let x = 1 in x";
-        let ti = build_type_index(source).unwrap();
+        let (ti, _) = build_type_index(source).unwrap();
         let x_binding_offset = source.find("x").unwrap();
         let entry = ti.node_at(x_binding_offset).unwrap();
         assert_eq!(entry.kind, TypeEntryKind::LetBinding);
@@ -101,7 +142,7 @@ mod tests {
     #[test]
     fn test_type_index_let_tuple_binding() {
         let source = "let (a, b) = (1, true) in b";
-        let ti = build_type_index(source).unwrap();
+        let (ti, _) = build_type_index(source).unwrap();
         let a_offset = source.find('a').unwrap();
         let a_entry = ti.node_at(a_offset).unwrap();
         assert_eq!(a_entry.kind, TypeEntryKind::LetBinding);
@@ -116,7 +157,7 @@ mod tests {
     #[test]
     fn test_type_index_let_and_bindings() {
         let source = "let a = 1 and b = true in b";
-        let ti = build_type_index(source).unwrap();
+        let (ti, _) = build_type_index(source).unwrap();
         let a_offset = source.find('a').unwrap();
         assert_eq!(
             ti.node_at(a_offset).unwrap().kind,
@@ -132,7 +173,7 @@ mod tests {
     #[test]
     fn test_type_index_swap_tuple_pattern() {
         let source = "let swap = |(a, b)| (b, a) in swap";
-        let ti = build_type_index(source).unwrap();
+        let (ti, _) = build_type_index(source).unwrap();
         let pipe = source.find('|').unwrap();
         let a_in_pattern = source[pipe..].find('a').unwrap() + pipe;
         let b_in_pattern = source[pipe..].find('b').unwrap() + pipe;
@@ -155,7 +196,7 @@ mod tests {
     #[test]
     fn test_type_index_scope_independent_renaming() {
         let source = "let const = |x| |y| x in let id = |x| x in id const";
-        let ti = build_type_index(source).unwrap();
+        let (ti, _) = build_type_index(source).unwrap();
         let id_binding_offset = source.find("id").unwrap();
         let id_entry = ti.node_at(id_binding_offset).unwrap();
         assert_eq!(id_entry.kind, TypeEntryKind::LetBinding);
@@ -180,11 +221,11 @@ impl Backend {
             };
             let Some(text) = text else { return };
 
-            let type_index = build_type_index(&text);
+            let typed = build_type_index(&text);
             {
                 let mut docs = documents.lock().unwrap();
                 if let Some(doc) = docs.get_mut(&uri) {
-                    doc.type_index = type_index;
+                    doc.typed = typed;
                 }
             }
 
@@ -234,7 +275,13 @@ impl LanguageServer for Backend {
 
         {
             let mut docs = self.documents.lock().unwrap();
-            docs.insert(uri.clone(), DocumentState { text, type_index });
+            docs.insert(
+                uri.clone(),
+                DocumentState {
+                    text,
+                    typed: type_index,
+                },
+            );
         }
 
         if let Err(e) = self
@@ -256,7 +303,7 @@ impl LanguageServer for Backend {
             let mut docs = self.documents.lock().unwrap();
             let doc = docs.entry(uri.clone()).or_insert(DocumentState {
                 text: String::new(),
-                type_index: None,
+                typed: None,
             });
             doc.text = new_text;
         }
@@ -292,32 +339,86 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
 
-        let entry = {
-            let docs = self.documents.lock().unwrap();
-            let doc = match docs.get(&uri) {
-                Some(doc) => doc,
-                None => return Ok(None),
-            };
-            let type_index = match doc.type_index.as_ref() {
-                Some(ti) => ti,
-                None => return Ok(None),
-            };
-            match type_index.node_at(offset) {
-                Some(e) => (e.start, e.end, e.ty.clone(), e.kind),
-                None => return Ok(None),
-            }
+        // Find the exact token at cursor via lexer
+        let lexer = Token::lexer(&text);
+        let (tok, span) = match lexer
+            .spanned()
+            .filter_map(|(tok, span)| match tok {
+                Ok(tok) => Some((tok, span.into())),
+                Err(()) => None,
+            })
+            .find(|(_, s): &(Token, std::ops::Range<usize>)| s.contains(&offset))
+        {
+            Some(v) => v,
+            None => return Ok(None),
         };
+        let (start, end) = (span.start, span.end);
 
-        let (start, end, ty, kind) = entry;
-        let ty_str = ty.to_string();
-        let word = &text[start..end];
-
-        let hover_value = match kind {
-            TypeEntryKind::LetBinding => format!("```mest\nlet {}: {}\n```", word, ty_str),
-            TypeEntryKind::ParamBinding | TypeEntryKind::MatchBinding => {
-                format!("```mest\n{}: {}\n```", word, ty_str)
+        // Derive hover info from the token and AST/typechecker
+        let hover_value = match &tok {
+            Token::Ident(name) if *name == "_" => "```mest\n_ : wildcard pattern\n```".into(),
+            Token::Ident(_) => {
+                // Variable / constructor name — use TypeIndex
+                let info = {
+                    let docs = self.documents.lock().unwrap();
+                    docs.get(&uri).and_then(|doc| {
+                        let (type_index, rodeo) = doc.typed.as_ref()?;
+                        let e = type_index.node_at(offset)?;
+                        let ty_str = type_to_string(&e.ty, rodeo);
+                        Some((e.start, e.end, ty_str, e.kind))
+                    })
+                };
+                match info {
+                    Some((s, e, ty_str, kind)) => {
+                        let word = &text[s..e];
+                        match kind {
+                            TypeEntryKind::LetBinding => {
+                                format!("```mest\nlet {}: {}\n```", word, ty_str)
+                            }
+                            TypeEntryKind::ParamBinding | TypeEntryKind::MatchBinding => {
+                                format!("```mest\n{}: {}\n```", word, ty_str)
+                            }
+                            TypeEntryKind::Expr => format!("```mest\n: {}\n```", ty_str),
+                        }
+                    }
+                    None => return Ok(None),
+                }
             }
-            TypeEntryKind::Expr => format!("```mest\n: {}\n```", ty_str),
+            Token::Int(_) | Token::Float(_) | Token::True | Token::False => {
+                // Literal — find the Literal expr's type via TypeIndex
+                let ty_str = {
+                    let docs = self.documents.lock().unwrap();
+                    docs.get(&uri).and_then(|doc| {
+                        let (type_index, rodeo) = doc.typed.as_ref()?;
+                        let e = type_index.node_at(offset)?;
+                        Some(type_to_string(&e.ty, rodeo))
+                    })
+                };
+                match ty_str {
+                    Some(s) => format!("```mest\n: {}\n```", s),
+                    None => return Ok(None),
+                }
+            }
+            Token::Let | Token::If | Token::Match | Token::Type => {
+                // Keyword with enclosing expression — show its type
+                let ty_str = {
+                    let docs = self.documents.lock().unwrap();
+                    docs.get(&uri).and_then(|doc| {
+                        let (type_index, rodeo) = doc.typed.as_ref()?;
+                        let e = type_index.node_at(offset)?;
+                        Some(type_to_string(&e.ty, rodeo))
+                    })
+                };
+                match ty_str {
+                    Some(s) => format!("```mest\n: {}\n```", s),
+                    None => return Ok(None),
+                }
+            }
+            tok if is_operator(tok) => match operator_type(tok) {
+                Some(s) => s,
+                None => return Ok(None),
+            },
+            _ => return Ok(None),
         };
 
         Ok(Some(Hover {
@@ -353,14 +454,14 @@ impl LanguageServer for Backend {
                 Some(doc) => doc,
                 None => return Ok(None),
             };
-            let type_index = match doc.type_index.as_ref() {
-                Some(ti) => ti,
+            let (type_index, rodeo) = match doc.typed.as_ref() {
+                Some(v) => v,
                 None => return Ok(None),
             };
             type_index
                 .entries_in_range(byte_start..byte_end)
                 .into_iter()
-                .map(|e| (e.end, e.ty.to_string()))
+                .map(|e| (e.end, type_to_string(&e.ty, rodeo)))
                 .collect()
         };
 
