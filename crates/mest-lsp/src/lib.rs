@@ -3,12 +3,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bumpalo::Bump;
-use chumsky::input::Input;
 use chumsky::{Parser, input::Stream};
 use lasso::Rodeo;
 use logos::Logos;
 use mest_core::{
-    ast::{BindPatKind, ExprKind, PatKind},
+    ast::{BindPat, BindPatKind, ExprKind, PatKind},
     hir::Type,
     parser::parser,
     token::Token,
@@ -127,21 +126,21 @@ fn collect_infer_nodes(tree: &InferenceTree, map: &mut AnnotationMap) {
 
             match &*expr.kind {
                 ExprKind::Let { bindings, .. } => {
-                    for (i, binding) in bindings.iter().enumerate() {
-                        if let BindPatKind::Var(name) = binding.pat.kind {
-                            if let Some(child) = tree.children.get(i) {
-                                if let Output::Type(val_ty) = &child.output {
-                                    let ident_range: std::ops::Range<usize> =
-                                        name.span.into_range();
-                                    map.spans.insert(
-                                        ident_range.start,
-                                        AnnotationEntry {
-                                            end: ident_range.end,
-                                            ty: rename_type(val_ty),
-                                            kind: BindingKind::Let,
-                                        },
-                                    );
-                                }
+                    for binding in bindings.iter() {
+                        let value_span: std::ops::Range<usize> =
+                            binding.value.span.into_range();
+                        if let Some(child) = tree.children.iter().find(|c| {
+                            if let InferInput::Infer { expr, .. } = &c.input {
+                                let expr_range: std::ops::Range<usize> =
+                                    expr.span.into_range();
+                                expr_range == value_span
+                            } else {
+                                false
+                            }
+                        }) {
+                            if let Output::Type(val_ty) = &child.output {
+                                let renamed = rename_type(val_ty);
+                                collect_bind_pat_types(&binding.pat, &renamed, map);
                             }
                         }
                     }
@@ -173,6 +172,29 @@ fn collect_infer_nodes(tree: &InferenceTree, map: &mut AnnotationMap) {
     }
     for child in &tree.children {
         collect_infer_nodes(child, map);
+    }
+}
+
+fn collect_bind_pat_types(pat: &BindPat, ty: &Type, map: &mut AnnotationMap) {
+    match pat.kind {
+        BindPatKind::Var(name) => {
+            let ident_range: std::ops::Range<usize> = name.span.into_range();
+            map.spans.insert(
+                ident_range.start,
+                AnnotationEntry {
+                    end: ident_range.end,
+                    ty: ty.clone(),
+                    kind: BindingKind::Let,
+                },
+            );
+        }
+        BindPatKind::Tuple(pats) => {
+            if let Type::Tuple(types) = ty {
+                for (sub_pat, sub_ty) in pats.iter().zip(types.iter()) {
+                    collect_bind_pat_types(sub_pat, sub_ty, map);
+                }
+            }
+        }
     }
 }
 
